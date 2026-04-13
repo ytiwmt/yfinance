@@ -12,17 +12,13 @@ webhook_url_yfinance = os.getenv("WEBHOOK_URL_YFINANCE")
 # -----------------------------
 def get_sp500_tickers():
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers)
         table = pd.read_html(response.text)[0]
         return [t.replace('.', '-') for t in table['Symbol'].tolist()]
-    except Exception as e:
-        print(f"Ticker Fetch Error: {e}")
+    except:
         return []
-
 
 # -----------------------------
 # 利回り統計
@@ -52,9 +48,8 @@ def calc_stats(stock, div_rate):
 
     return cur_yield, mean, z
 
-
 # -----------------------------
-# FCF取得（安定版）
+# FCF取得
 # -----------------------------
 def get_fcf(stock):
     try:
@@ -79,9 +74,8 @@ def get_fcf(stock):
     except:
         return None
 
-
 # -----------------------------
-# メイン処理
+# メイン
 # -----------------------------
 def analyze_market():
     if not webhook_url_yfinance:
@@ -108,6 +102,7 @@ def analyze_market():
                 continue
 
             cur_yield, avg_yield, z = stats
+            delta = cur_yield - avg_yield  # ← 重要
 
             payout = info.get('payoutRatio')
             debt = info.get('totalDebt')
@@ -121,37 +116,37 @@ def analyze_market():
             if cur_yield > 4 and z > 1.2:
 
                 if payout and payout > 0.8:
-                    pass
-                else:
-                    if fcf and shares:
-                        total_div = div_rate * shares
-                        if fcf < total_div * 0.8:
-                            pass
-                        else:
-                            if debt and ebitda and ebitda > 0:
-                                if debt / ebitda > 4:
-                                    pass
-                                else:
-                                    income_dislocation.append({
-                                        "Symbol": symbol,
-                                        "Yield": f"{cur_yield:.2f}%",
-                                        "Avg": f"{avg_yield:.2f}%",
-                                        "Z": f"{z:.2f}"
-                                    })
-                            else:
-                                income_dislocation.append({
-                                    "Symbol": symbol,
-                                    "Yield": f"{cur_yield:.2f}%",
-                                    "Avg": f"{avg_yield:.2f}%",
-                                    "Z": f"{z:.2f}"
-                                })
+                    continue
+
+                if fcf and shares:
+                    total_div = div_rate * shares
+                    if fcf < total_div * 0.8:
+                        continue
+
+                if debt and ebitda and ebitda > 0:
+                    if debt / ebitda > 4:
+                        continue
+
+                income_dislocation.append({
+                    "Symbol": symbol,
+                    "Yield": f"{cur_yield:.2f}%",
+                    "Avg": f"{avg_yield:.2f}%",
+                    "Z": f"{z:.2f}"
+                })
 
             # =========================
-            # ② クオリティ・ディスカウント
+            # ② クオリティ・ディスカウント（修正版）
             # =========================
+
+            # ノイズ除去①：最低利回り
             if cur_yield < 2:
-                continue  # ← ノイズ排除
+                continue
 
+            # ノイズ除去②：絶対差（←ここが今回の核心）
+            if delta < 0.8:
+                continue
+
+            # 相対乖離
             if avg_yield > 0:
                 ratio = cur_yield / avg_yield
             else:
@@ -198,7 +193,6 @@ def analyze_market():
 
     send_notification(income_dislocation, quality_discount)
 
-
 # -----------------------------
 # 通知
 # -----------------------------
@@ -231,7 +225,7 @@ def send_notification(income, quality):
             })
 
         payload = {
-            "content": "📊 デュアル検知レポート",
+            "content": "📊 デュアル検知レポート（ノイズ除去版）",
             "embeds": embeds
         }
 
@@ -240,7 +234,6 @@ def send_notification(income, quality):
         data=json.dumps(payload),
         headers={"Content-Type": "application/json"}
     )
-
 
 # -----------------------------
 # 実行
