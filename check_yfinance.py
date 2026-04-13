@@ -66,7 +66,6 @@ def send_rich_notification(deals):
                     {"name": "過去2年平均", "value": d['Avg'], "inline": True},
                     {"name": "配当性向", "value": d['Payout'], "inline": True}
                 ],
-                "footer": {"text": "Yahoo Finance Data / GitHub Actions"}
             })
         
         # 1回に最大10個のEmbedを送れる
