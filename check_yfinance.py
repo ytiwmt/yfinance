@@ -7,19 +7,28 @@ import numpy as np
 
 webhook_url_yfinance = os.getenv("WEBHOOK_URL_YFINANCE")
 
+
+# -----------------------------
+# S&P500銘柄取得
+# -----------------------------
 def get_sp500_tickers():
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers)
-        return [t.replace('.', '-') for t in pd.read_html(response.text)[0]['Symbol'].tolist()]
+        table = pd.read_html(response.text)[0]
+        return [t.replace('.', '-') for t in table['Symbol'].tolist()]
     except:
         return []
 
-def calc_yield_zscore(stock, div_rate):
+
+# -----------------------------
+# 利回りZスコア
+# -----------------------------
+def calc_yield_stats(stock, div_rate):
     hist = stock.history(period="2y")
     if hist.empty:
-        return None, None, None
+        return None
 
     prices = hist['Close']
     yields = (div_rate / prices) * 100
@@ -27,15 +36,23 @@ def calc_yield_zscore(stock, div_rate):
     mean = yields.mean()
     std = yields.std()
 
-    current_price = prices.iloc[-1]
-    current_yield = (div_rate / current_price) * 100
-
     if std == 0:
-        return None, None, None
+        return None
 
-    zscore = (current_yield - mean) / std
-    return current_yield, mean, zscore
+    cur_price = prices.iloc[-1]
+    cur_yield = (div_rate / cur_price) * 100
+    z = (cur_yield - mean) / std
 
+    return {
+        "cur": cur_yield,
+        "avg": mean,
+        "z": z
+    }
+
+
+# -----------------------------
+# FCF
+# -----------------------------
 def get_fcf(stock):
     try:
         cf = stock.cashflow
@@ -45,16 +62,22 @@ def get_fcf(stock):
         op_cf = cf.loc['Total Cash From Operating Activities'].iloc[0]
         capex = cf.loc['Capital Expenditures'].iloc[0]
 
-        return op_cf + capex  # capexはマイナスなので加算
+        return op_cf + capex
     except:
         return None
 
+
+# -----------------------------
+# メイン
+# -----------------------------
 def analyze_market():
     if not webhook_url_yfinance:
         return
 
     tickers = get_sp500_tickers()
-    found = []
+
+    high_yield_bug = []
+    quality_discount = []
 
     for symbol in tickers:
         try:
@@ -67,74 +90,133 @@ def analyze_market():
             if not price or not div_rate or div_rate <= 0:
                 continue
 
-            # ---------- Step1: 異常検知 ----------
-            cur_yield, avg_yield, z = calc_yield_zscore(stock, div_rate)
-            if z is None or z < 1.5:
+            stats = calc_yield_stats(stock, div_rate)
+            if not stats:
                 continue
 
-            # ---------- Step2: 生存判定 ----------
+            cur_yield = stats["cur"]
+            avg_yield = stats["avg"]
+            z = stats["z"]
+
             payout = info.get('payoutRatio')
-            if payout and payout > 0.8:
-                continue
-
-            fcf = get_fcf(stock)
-            shares = info.get('sharesOutstanding')
-
-            if not fcf or not shares:
-                continue
-
-            total_div = div_rate * shares
-
-            if fcf < total_div:
-                continue
-
-            # ---------- Step3: 財務健全性 ----------
             debt = info.get('totalDebt')
             ebitda = info.get('ebitda')
+            shares = info.get('sharesOutstanding')
+            fcf = get_fcf(stock)
 
-            if debt and ebitda and ebitda > 0:
-                if debt / ebitda > 3:
-                    continue
+            # =========================
+            # ① 高配当バグ検知
+            # =========================
+            if cur_yield > 4 and z > 1.2:
 
-            found.append({
-                "Symbol": symbol,
-                "Yield": f"{cur_yield:.2f}%",
-                "Avg": f"{avg_yield:.2f}%",
-                "Z": f"{z:.2f}",
-                "RawYield": cur_yield
-            })
+                # 生存判定
+                if payout and payout > 0.8:
+                    pass
+                else:
+                    if fcf and shares:
+                        total_div = div_rate * shares
+                        if fcf < total_div * 0.8:
+                            pass
+                        else:
+                            if debt and ebitda and ebitda > 0:
+                                if debt / ebitda > 4:
+                                    pass
+                                else:
+                                    high_yield_bug.append({
+                                        "Symbol": symbol,
+                                        "Yield": f"{cur_yield:.2f}%",
+                                        "Avg": f"{avg_yield:.2f}%",
+                                        "Z": f"{z:.2f}"
+                                    })
+                            else:
+                                high_yield_bug.append({
+                                    "Symbol": symbol,
+                                    "Yield": f"{cur_yield:.2f}%",
+                                    "Avg": f"{avg_yield:.2f}%",
+                                    "Z": f"{z:.2f}"
+                                })
+
+            # =========================
+            # ② 高品質ディスカウント
+            # =========================
+            if z > 0.8:
+
+                if payout and payout < 0.6:
+
+                    rev_growth = info.get('revenueGrowth')
+                    if rev_growth and rev_growth > 0:
+
+                        if debt and ebitda and ebitda > 0:
+                            if debt / ebitda < 3:
+                                quality_discount.append({
+                                    "Symbol": symbol,
+                                    "Yield": f"{cur_yield:.2f}%",
+                                    "Avg": f"{avg_yield:.2f}%",
+                                    "Z": f"{z:.2f}"
+                                })
+                        else:
+                            quality_discount.append({
+                                "Symbol": symbol,
+                                "Yield": f"{cur_yield:.2f}%",
+                                "Avg": f"{avg_yield:.2f}%",
+                                "Z": f"{z:.2f}"
+                            })
 
         except:
             continue
 
-    top = sorted(found, key=lambda x: x['RawYield'], reverse=True)[:5]
-    send_notification(top)
+    # ソート
+    high_yield_bug = sorted(high_yield_bug, key=lambda x: float(x['Yield'][:-1]), reverse=True)[:3]
+    quality_discount = sorted(quality_discount, key=lambda x: float(x['Z']), reverse=True)[:3]
 
-def send_notification(deals):
-    if not deals:
-        payload = {
-            "content": "📡 バグ検知なし（条件を満たす銘柄なし）"
-        }
+    send_notification(high_yield_bug, quality_discount)
+
+
+# -----------------------------
+# 通知
+# -----------------------------
+def send_notification(bugs, quality):
+    if not bugs and not quality:
+        payload = {"content": "📡 検知なし（完全平常）"}
     else:
         embeds = []
-        for d in deals:
+
+        for d in bugs:
             embeds.append({
-                "title": f"💎 バグ候補: {d['Symbol']}",
+                "title": f"🔥 高配当バグ: {d['Symbol']}",
+                "color": 15158332,
+                "fields": [
+                    {"name": "利回り", "value": d['Yield'], "inline": True},
+                    {"name": "平均", "value": d['Avg'], "inline": True},
+                    {"name": "Z", "value": d['Z'], "inline": True}
+                ]
+            })
+
+        for d in quality:
+            embeds.append({
+                "title": f"💎 高品質割安: {d['Symbol']}",
                 "color": 3447003,
                 "fields": [
                     {"name": "利回り", "value": d['Yield'], "inline": True},
-                    {"name": "平均利回り", "value": d['Avg'], "inline": True},
-                    {"name": "Zスコア", "value": d['Z'], "inline": True}
+                    {"name": "平均", "value": d['Avg'], "inline": True},
+                    {"name": "Z", "value": d['Z'], "inline": True}
                 ]
             })
 
         payload = {
-            "content": "✅ 実務フィルタ通過銘柄",
+            "content": "📊 デュアルスクリーニング結果",
             "embeds": embeds
         }
 
-    requests.post(webhook_url_yfinance, data=json.dumps(payload),
-                  headers={"Content-Type": "application/json"})
+    requests.post(
+        webhook_url_yfinance,
+        data=json.dumps(payload),
+        headers={"Content-Type": "application/json"}
+    )
 
+
+# -----------------------------
+# 実行
+# -----------------------------
 if __name__ == "__main__":
     analyze_market()
