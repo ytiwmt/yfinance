@@ -4,90 +4,78 @@ import requests
 import json
 import os
 
-# GitHub Secretsから取得
 webhook_url_yfinance = os.getenv("WEBHOOK_URL_YFINANCE")
 
 def get_sp500_tickers():
-    """WikipediaからS&P500銘柄を403回避しつつ取得"""
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers)
-        response.raise_for_status()
         tables = pd.read_html(response.text)
         return [t.replace('.', '-') for t in tables[0]['Symbol'].tolist()]
-    except Exception as e:
-        print(f"List acquisition error: {e}")
+    except:
         return []
 
 def analyze_market():
-    if not webhook_url_yfinance:
-        print("Error: WEBHOOK_URL_YFINANCE is not set.")
-        return
+    if not webhook_url_yfinance: return
 
     tickers = get_sp500_tickers()
     found_opportunities = []
-    print(f"Scanning {len(tickers)} stocks...")
 
     for symbol in tickers:
         try:
             stock = yf.Ticker(symbol)
             info = stock.info
-            
-            # --- 確実な利回り計算ロジック ---
-            # 1. 現在の株価
-            current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-            # 2. 年間配当額（ドル）
+            price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
             div_rate = info.get('trailingAnnualDividendRate') or info.get('dividendRate')
             
-            if not current_price or not div_rate or div_rate <= 0:
-                continue
+            if not price or not div_rate or div_rate <= 0: continue
                 
-            # 自前で利回りを計算（確実）
-            cur_yield = (div_rate / current_price) * 100
-            
-            # 配当性向
+            cur_yield = (div_rate / price) * 100
             payout = info.get('payoutRatio', 0) * 100
             
-            # フィルタ：利回り3.5%以上、配当性向80%以下
-            if cur_yield < 3.5 or payout > 80 or payout <= 0:
-                continue
+            if cur_yield < 3.5 or payout > 80 or payout <= 0: continue
 
-            # 過去2年の平均利回り（ヒストリカル・データから算出）
             hist = stock.history(period="2y")
-            if hist.empty:
-                continue
+            avg_yield_2y = (div_rate / hist['Close'].mean()) * 100
             
-            avg_price_2y = hist['Close'].mean()
-            # 過去2年の平均的な価格に対する今の配当額の利回り
-            avg_yield_2y = (div_rate / avg_price_2y) * 100
-            
-            # 現在の利回りが過去平均より20%以上高い（＝歴史的に割安）
             if cur_yield > (avg_yield_2y * 1.2):
                 found_opportunities.append({
                     "Symbol": symbol,
-                    "Yield": cur_yield,
-                    "AvgYield": avg_yield_2y,
-                    "Payout": payout
+                    "Yield": f"{cur_yield:.2f}%",
+                    "Avg": f"{avg_yield_2y:.2f}%",
+                    "Payout": f"{payout:.1f}%",
+                    "RawYield": cur_yield
                 })
-        except:
-            continue
+        except: continue
 
-    # 通知処理
-    top_deals = sorted(found_opportunities, key=lambda x: x['Yield'], reverse=True)[:10]
-    
-    if top_deals:
-        msg = "【米国株・流動性バグ検知レポート】\n"
-        for d in top_deals:
-            msg += f"✅ **{d['Symbol']}**: 利回り{d['Yield']:.2f}% (平均{d['AvgYield']:.2f}%) / 配当性向{d['Payout']:.1f}%\n"
-        send_discord_message(msg)
+    top_deals = sorted(found_opportunities, key=lambda x: x['RawYield'], reverse=True)[:10]
+    send_rich_notification(top_deals)
+
+def send_rich_notification(deals):
+    if not deals:
+        payload = {"content": "📡 **市場パトロール完了**: 異常なし。"}
     else:
-        send_discord_message("本日、条件に合致する「バグ」銘柄は見つかりませんでした。")
-
-def send_discord_message(content):
-    payload = {"content": content}
-    headers = {"Content-Type": "application/json"}
-    requests.post(webhook_url_yfinance, data=json.dumps(payload), headers=headers)
+        embeds = []
+        for d in deals:
+            embeds.append({
+                "title": f"🚀 {d['Symbol']} がバグ水準です",
+                "color": 3066993, # 緑色
+                "fields": [
+                    {"name": "現在利回り", "value": d['Yield'], "inline": True},
+                    {"name": "過去2年平均", "value": d['Avg'], "inline": True},
+                    {"name": "配当性向", "value": d['Payout'], "inline": True}
+                ],
+                "footer": {"text": "Yahoo Finance Data / GitHub Actions"}
+            })
+        
+        # 1回に最大10個のEmbedを送れる
+        payload = {
+            "content": "⚠️ **【米国株・流動性バグ検知】** 以下の銘柄が歴史的割安水準にあります。",
+            "embeds": embeds
+        }
+    
+    requests.post(webhook_url_yfinance, data=json.dumps(payload), headers={"Content-Type": "application/json"})
 
 if __name__ == "__main__":
     analyze_market()
