@@ -2,10 +2,11 @@ name: US Stock Market Monitor
 
 on:
   schedule:
-    # 毎日 UTC 22:00 (日本時間 JST 07:00) に実行
-    # 米国市場クローズ後のタイミング
-    - cron: '0 22 * * 1-5'
-  workflow_dispatch: # 手動実行用ボタンを有効化
+    # JST 08:00 / 08:15 / 08:30（= UTC 23:00 / 23:15 / 23:30）
+    - cron: '0 23 * * 1-5'
+    - cron: '15 23 * * 1-5'
+    - cron: '30 23 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -27,6 +28,5 @@ jobs:
 
       - name: Run script
         env:
-          # GitHubのSettings > Secretsで登録した名前と一致させる
           WEBHOOK_URL_YFINANCE: ${{ secrets.WEBHOOK_URL_YFINANCE }}
         run: python check_yfinance.py
