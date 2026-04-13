@@ -225,7 +225,7 @@ def send_notification(income, quality):
             })
 
         payload = {
-            "content": "📊 デュアル検知レポート（ノイズ除去版）",
+            "content": "📊 デュアル検知レポート",
             "embeds": embeds
         }
 
