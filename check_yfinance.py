@@ -7,51 +7,54 @@ import numpy as np
 
 webhook_url_yfinance = os.getenv("WEBHOOK_URL_YFINANCE")
 
-
 # -----------------------------
-# S&P500銘柄取得
+# S&P500取得
 # -----------------------------
 def get_sp500_tickers():
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
     try:
         response = requests.get(url, headers=headers)
         table = pd.read_html(response.text)[0]
         return [t.replace('.', '-') for t in table['Symbol'].tolist()]
-    except:
+    except Exception as e:
+        print(f"Ticker Fetch Error: {e}")
         return []
 
 
 # -----------------------------
-# 利回りZスコア
+# 利回り統計
 # -----------------------------
-def calc_yield_stats(stock, div_rate):
+def calc_stats(stock, div_rate):
     hist = stock.history(period="2y")
+
     if hist.empty:
         return None
 
-    prices = hist['Close']
+    prices = hist['Close'].dropna()
+
+    if len(prices) < 100:
+        return None
+
     yields = (div_rate / prices) * 100
 
     mean = yields.mean()
     std = yields.std()
 
-    if std == 0:
+    if std == 0 or np.isnan(std):
         return None
 
     cur_price = prices.iloc[-1]
     cur_yield = (div_rate / cur_price) * 100
     z = (cur_yield - mean) / std
 
-    return {
-        "cur": cur_yield,
-        "avg": mean,
-        "z": z
-    }
+    return cur_yield, mean, z
 
 
 # -----------------------------
-# FCF
+# FCF取得（安定版）
 # -----------------------------
 def get_fcf(stock):
     try:
@@ -59,16 +62,26 @@ def get_fcf(stock):
         if cf is None or cf.empty:
             return None
 
-        op_cf = cf.loc['Total Cash From Operating Activities'].iloc[0]
-        capex = cf.loc['Capital Expenditures'].iloc[0]
+        op_cf = None
+        capex = None
+
+        for label in cf.index:
+            if "Operating" in label:
+                op_cf = cf.loc[label].iloc[0]
+            if "Capital" in label:
+                capex = cf.loc[label].iloc[0]
+
+        if op_cf is None or capex is None:
+            return None
 
         return op_cf + capex
+
     except:
         return None
 
 
 # -----------------------------
-# メイン
+# メイン処理
 # -----------------------------
 def analyze_market():
     if not webhook_url_yfinance:
@@ -76,7 +89,7 @@ def analyze_market():
 
     tickers = get_sp500_tickers()
 
-    high_yield_bug = []
+    income_dislocation = []
     quality_discount = []
 
     for symbol in tickers:
@@ -90,13 +103,11 @@ def analyze_market():
             if not price or not div_rate or div_rate <= 0:
                 continue
 
-            stats = calc_yield_stats(stock, div_rate)
+            stats = calc_stats(stock, div_rate)
             if not stats:
                 continue
 
-            cur_yield = stats["cur"]
-            avg_yield = stats["avg"]
-            z = stats["z"]
+            cur_yield, avg_yield, z = stats
 
             payout = info.get('payoutRatio')
             debt = info.get('totalDebt')
@@ -105,11 +116,10 @@ def analyze_market():
             fcf = get_fcf(stock)
 
             # =========================
-            # ① 高配当バグ検知
+            # ① インカム異常
             # =========================
             if cur_yield > 4 and z > 1.2:
 
-                # 生存判定
                 if payout and payout > 0.8:
                     pass
                 else:
@@ -122,14 +132,14 @@ def analyze_market():
                                 if debt / ebitda > 4:
                                     pass
                                 else:
-                                    high_yield_bug.append({
+                                    income_dislocation.append({
                                         "Symbol": symbol,
                                         "Yield": f"{cur_yield:.2f}%",
                                         "Avg": f"{avg_yield:.2f}%",
                                         "Z": f"{z:.2f}"
                                     })
                             else:
-                                high_yield_bug.append({
+                                income_dislocation.append({
                                     "Symbol": symbol,
                                     "Yield": f"{cur_yield:.2f}%",
                                     "Avg": f"{avg_yield:.2f}%",
@@ -137,9 +147,17 @@ def analyze_market():
                                 })
 
             # =========================
-            # ② 高品質ディスカウント
+            # ② クオリティ・ディスカウント
             # =========================
-            if z > 0.8:
+            if cur_yield < 2:
+                continue  # ← ノイズ排除
+
+            if avg_yield > 0:
+                ratio = cur_yield / avg_yield
+            else:
+                continue
+
+            if ratio > 1.4 and z > 1.0:
 
                 if payout and payout < 0.6:
 
@@ -166,24 +184,33 @@ def analyze_market():
             continue
 
     # ソート
-    high_yield_bug = sorted(high_yield_bug, key=lambda x: float(x['Yield'][:-1]), reverse=True)[:3]
-    quality_discount = sorted(quality_discount, key=lambda x: float(x['Z']), reverse=True)[:3]
+    income_dislocation = sorted(
+        income_dislocation,
+        key=lambda x: float(x['Yield'][:-1]),
+        reverse=True
+    )[:3]
 
-    send_notification(high_yield_bug, quality_discount)
+    quality_discount = sorted(
+        quality_discount,
+        key=lambda x: float(x['Z']),
+        reverse=True
+    )[:3]
+
+    send_notification(income_dislocation, quality_discount)
 
 
 # -----------------------------
 # 通知
 # -----------------------------
-def send_notification(bugs, quality):
-    if not bugs and not quality:
-        payload = {"content": "📡 検知なし（完全平常）"}
+def send_notification(income, quality):
+    if not income and not quality:
+        payload = {"content": "📡 検知なし（市場平常）"}
     else:
         embeds = []
 
-        for d in bugs:
+        for d in income:
             embeds.append({
-                "title": f"🔥 高配当バグ: {d['Symbol']}",
+                "title": f"🔥 インカム異常: {d['Symbol']}",
                 "color": 15158332,
                 "fields": [
                     {"name": "利回り", "value": d['Yield'], "inline": True},
@@ -194,7 +221,7 @@ def send_notification(bugs, quality):
 
         for d in quality:
             embeds.append({
-                "title": f"💎 高品質割安: {d['Symbol']}",
+                "title": f"💎 クオリティ・ディスカウント: {d['Symbol']}",
                 "color": 3447003,
                 "fields": [
                     {"name": "利回り", "value": d['Yield'], "inline": True},
@@ -204,7 +231,7 @@ def send_notification(bugs, quality):
             })
 
         payload = {
-            "content": "📊 デュアルスクリーニング結果",
+            "content": "📊 デュアル検知レポート",
             "embeds": embeds
         }
 
