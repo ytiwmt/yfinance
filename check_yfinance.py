@@ -21,7 +21,7 @@ def get_sp500_tickers():
         return []
 
 # -----------------------------
-# 利回り統計
+# 利回り統計 + 価格情報
 # -----------------------------
 def calc_stats(stock, div_rate):
     hist = stock.history(period="2y")
@@ -42,11 +42,15 @@ def calc_stats(stock, div_rate):
     if std == 0 or np.isnan(std):
         return None
 
-    cur_price = prices.iloc[-1]
-    cur_yield = (div_rate / cur_price) * 100
+    current_price = prices.iloc[-1]
+    prev_close = prices.iloc[-2]
+
+    cur_yield = (div_rate / current_price) * 100
     z = (cur_yield - mean) / std
 
-    return cur_yield, mean, z
+    change_pct = ((current_price - prev_close) / prev_close) * 100
+
+    return cur_yield, mean, z, current_price, prev_close, change_pct
 
 # -----------------------------
 # FCF取得
@@ -101,7 +105,7 @@ def analyze_market():
             if not stats:
                 continue
 
-            cur_yield, avg_yield, z = stats
+            cur_yield, avg_yield, z, current_price, prev_close, change_pct = stats
             delta = cur_yield - avg_yield
 
             payout = info.get('payoutRatio')
@@ -131,26 +135,25 @@ def analyze_market():
                     "Symbol": symbol,
                     "Yield": f"{cur_yield:.2f}%",
                     "Avg": f"{avg_yield:.2f}%",
-                    "Z": f"{z:.2f}"
+                    "Z": f"{z:.2f}",
+                    "Price": f"{current_price:.2f}",
+                    "Change": f"{change_pct:+.2f}%",
+                    "PrevClose": f"{prev_close:.2f}"
                 })
 
             # =========================
-            # ② クオリティ・ディスカウント（修正版）
+            # ② クオリティ・ディスカウント
             # =========================
 
-            # 排他性：高配当は除外（HPQ重複防止）
             if cur_yield > 4:
                 continue
 
-            # 最低利回り
             if cur_yield < 2:
                 continue
 
-            # 絶対差フィルタ（強化版）
             if delta < 1.0:
                 continue
 
-            # 相対乖離
             if avg_yield > 0:
                 ratio = cur_yield / avg_yield
             else:
@@ -169,20 +172,25 @@ def analyze_market():
                                     "Symbol": symbol,
                                     "Yield": f"{cur_yield:.2f}%",
                                     "Avg": f"{avg_yield:.2f}%",
-                                    "Z": f"{z:.2f}"
+                                    "Z": f"{z:.2f}",
+                                    "Price": f"{current_price:.2f}",
+                                    "Change": f"{change_pct:+.2f}%",
+                                    "PrevClose": f"{prev_close:.2f}"
                                 })
                         else:
                             quality_discount.append({
                                 "Symbol": symbol,
                                 "Yield": f"{cur_yield:.2f}%",
                                 "Avg": f"{avg_yield:.2f}%",
-                                "Z": f"{z:.2f}"
+                                "Z": f"{z:.2f}",
+                                "Price": f"{current_price:.2f}",
+                                "Change": f"{change_pct:+.2f}%",
+                                "PrevClose": f"{prev_close:.2f}"
                             })
 
         except:
             continue
 
-    # ソート
     income_dislocation = sorted(
         income_dislocation,
         key=lambda x: float(x['Yield'][:-1]),
@@ -213,7 +221,10 @@ def send_notification(income, quality):
                 "fields": [
                     {"name": "利回り", "value": d['Yield'], "inline": True},
                     {"name": "平均", "value": d['Avg'], "inline": True},
-                    {"name": "Z", "value": d['Z'], "inline": True}
+                    {"name": "Z", "value": d['Z'], "inline": True},
+                    {"name": "現在価格", "value": d['Price'], "inline": True},
+                    {"name": "前日終値", "value": d['PrevClose'], "inline": True},
+                    {"name": "変化率", "value": d['Change'], "inline": True}
                 ]
             })
 
@@ -224,7 +235,10 @@ def send_notification(income, quality):
                 "fields": [
                     {"name": "利回り", "value": d['Yield'], "inline": True},
                     {"name": "平均", "value": d['Avg'], "inline": True},
-                    {"name": "Z", "value": d['Z'], "inline": True}
+                    {"name": "Z", "value": d['Z'], "inline": True},
+                    {"name": "現在価格", "value": d['Price'], "inline": True},
+                    {"name": "前日終値", "value": d['PrevClose'], "inline": True},
+                    {"name": "変化率", "value": d['Change'], "inline": True}
                 ]
             })
 
