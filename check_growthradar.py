@@ -20,25 +20,24 @@ MIN_GROWTH = 0.25
 MIN_GROSS_MARGIN = 0.40
 
 TOP_N = 20
-MAX_WORKERS = 5  # 無料プラン対策
+MAX_WORKERS = 5  # FMPレート制限対策
 
 # =========================
-# 母集団取得（安全版）
+# 母集団取得（新API対応）
 # =========================
 def get_tickers():
-    url = f"https://financialmodelingprep.com/api/v3/stock/list?apikey={FMP_API_KEY}"
+    url = f"https://financialmodelingprep.com/api/v3/available-traded/list?apikey={FMP_API_KEY}"
     
     res = requests.get(url, timeout=10)
     print("STATUS:", res.status_code)
 
     try:
         data = res.json()
-    except Exception as e:
-        print("JSON decode error:", e)
-        print("RAW:", res.text[:200])
+    except Exception:
+        print("JSON decode error")
+        print(res.text[:300])
         return []
 
-    # 型チェック（最重要）
     if not isinstance(data, list):
         print("API ERROR RESPONSE:", data)
         return []
@@ -47,6 +46,7 @@ def get_tickers():
     for d in data:
         if not isinstance(d, dict):
             continue
+
         if d.get("exchangeShortName") == "NASDAQ":
             symbol = d.get("symbol")
             if symbol:
@@ -56,10 +56,11 @@ def get_tickers():
     return tickers
 
 # =========================
-# 個別データ取得（耐障害）
+# 財務取得
 # =========================
 def fetch_data(ticker):
     try:
+        # 売上（3年）
         url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=3&apikey={FMP_API_KEY}"
         res = requests.get(url, timeout=10)
         fin = res.json()
@@ -77,6 +78,7 @@ def fetch_data(ticker):
         yoy = (rev_latest - rev_prev) / rev_prev
         cagr = (rev_latest / rev_3y) ** (1/2) - 1
 
+        # プロファイル
         url2 = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
         res2 = requests.get(url2, timeout=10)
         prof = res2.json()
@@ -105,20 +107,19 @@ def fetch_data(ticker):
 # フィルタ
 # =========================
 def pass_filter(d):
-    if d["market_cap"] < MIN_MARKET_CAP:
-        return False
-    if d["yoy"] < MIN_GROWTH:
-        return False
-    if d["gross_margin"] < MIN_GROSS_MARGIN:
-        return False
-    return True
+    return (
+        d["market_cap"] >= MIN_MARKET_CAP and
+        d["yoy"] >= MIN_GROWTH and
+        d["gross_margin"] >= MIN_GROSS_MARGIN
+    )
 
 # =========================
-# スコア
+# スコアリング
 # =========================
 def score(d):
     s = 0
 
+    # Growth
     if d["yoy"] > 0.60:
         s += 5
     elif d["yoy"] > 0.40:
@@ -131,6 +132,7 @@ def score(d):
     elif d["cagr"] > 0.25:
         s += 1
 
+    # Quality
     if d["gross_margin"] > 0.70:
         s += 3
     elif d["gross_margin"] > 0.50:
@@ -141,21 +143,21 @@ def score(d):
     return s
 
 # =========================
-# Discord通知
+# Discord
 # =========================
 def send_discord(df):
     if not WEBHOOK_URL:
-        print("No webhook set")
+        print("Webhook not set")
         return
 
     if df.empty:
-        msg = "No candidates found"
+        msg = "No GrowthRadar candidates"
     else:
         msg = "🚀 GrowthRadar TOP\n\n"
-        for _, row in df.iterrows():
+        for _, r in df.iterrows():
             msg += (
-                f"{row['Ticker']} | Score:{row['Score']}\n"
-                f"YoY:{row['YoY%']}% CAGR:{row['CAGR%']}%\n\n"
+                f"{r['Ticker']} | Score:{r['Score']}\n"
+                f"YoY:{r['YoY%']}% CAGR:{r['CAGR%']}%\n\n"
             )
 
     requests.post(WEBHOOK_URL, json={"content": msg})
@@ -167,13 +169,13 @@ def main():
     tickers = get_tickers()
 
     if not tickers:
-        print("No tickers fetched. Exiting.")
+        print("No tickers fetched")
         return
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(fetch_data, t) for t in tickers]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(fetch_data, t) for t in tickers]
 
         for f in as_completed(futures):
             d = f.result()
@@ -183,21 +185,19 @@ def main():
             if not pass_filter(d):
                 continue
 
-            s = score(d)
-
             results.append({
                 "Ticker": d["ticker"],
                 "YoY%": round(d["yoy"] * 100, 1),
                 "CAGR%": round(d["cagr"] * 100, 1),
                 "GrossMargin%": round(d["gross_margin"] * 100, 1),
-                "Score": s,
+                "Score": score(d),
                 "MarketCap(B)": round(d["market_cap"] / 1e9, 2)
             })
 
     df = pd.DataFrame(results)
 
     if df.empty:
-        print("No candidates")
+        print("No candidates found")
         send_discord(df)
         return
 
