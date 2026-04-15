@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 設定
 # =========================
 FMP_API_KEY = "YOUR_API_KEY"
-DISCORD_WEBHOOK_URL = "WEBHOOK_URL_GrowthRader"
+DISCORD_WEBHOOK_URL = "WEBHOOK_URL_GrowthRadar"
 
 MIN_MARKET_CAP = 300_000_000
 MIN_GROWTH = 0.25
