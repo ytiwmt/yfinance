@@ -14,32 +14,20 @@ if not FMP_API_KEY:
 
 
 # =========================
-# SAFE UNIVERSE (壊れないRussell代替)
+# UNIVERSE（壊れない版）
 # =========================
 def get_tickers():
-    """
-    Russell 3000代替（安定版）
-    ※外部壊れCSVを排除
-    """
     url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
     df = pd.read_csv(url)
 
     tickers = df["Symbol"].dropna().tolist()
 
-    # 少し拡張（NYSE系も混ぜる）
-    url2 = "https://datahub.io/core/nyse-other-listings/r/nyse-listed-symbols.csv"
-    df2 = pd.read_csv(url2)
-
-    tickers += df2["ACT Symbol"].dropna().tolist()
-
-    tickers = list(set(tickers))
-
-    print("Universe loaded:", len(tickers))
+    print("Tickers loaded:", len(tickers))
     return tickers
 
 
 # =========================
-# FETCH DATA
+# DATA FETCH
 # =========================
 def fetch(ticker):
     try:
@@ -49,9 +37,11 @@ def fetch(ticker):
         if not isinstance(r, list) or not r:
             return None
 
-        mcap = r[0].get("mktCap")
-        price = r[0].get("price")
-        sector = r[0].get("sector")
+        data = r[0]
+
+        mcap = data.get("mktCap")
+        price = data.get("price")
+        sector = data.get("sector")
 
         if not mcap or not price:
             return None
@@ -68,12 +58,12 @@ def fetch(ticker):
 
 
 # =========================
-# SCORE (テンバガー寄り)
+# SCORE（テンバガー寄り）
 # =========================
 def score(d):
     s = 0
 
-    # 小型ほど強く加点
+    # 小型優遇
     if d["mcap"] < 500_000_000:
         s += 5
     elif d["mcap"] < 1_000_000_000:
@@ -83,7 +73,7 @@ def score(d):
     else:
         s += 1
 
-    # セクター補正
+    # セクター加点
     if d["sector"] in ["Technology", "Healthcare"]:
         s += 1
 
@@ -101,7 +91,7 @@ def notify(df):
     if df.empty:
         msg = "⚠️ GrowthRadar v2: No candidates"
     else:
-        msg = "🚀 GrowthRadar v2 (Attack Mode)\n\n"
+        msg = "🚀 GrowthRadar v2\n\n"
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
