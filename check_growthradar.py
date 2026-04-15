@@ -36,42 +36,40 @@ def safe_get(url, params=None):
 def get_tickers():
     url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
     df = pd.read_csv(url)
-
-    tickers = df["Symbol"].dropna().tolist()
-    print(f"Tickers loaded: {len(tickers)}")
-
-    return tickers
+    return df["Symbol"].dropna().tolist()
 
 
 # =========================
-# BASE
+# GROWTH + ACCELERATION
 # =========================
-def fetch_base(ticker):
+def fetch_growth_accel(ticker):
     try:
-        url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}"
-        params = {"apikey": FMP_API_KEY}
+        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
+        params = {"limit": 4, "apikey": FMP_API_KEY}
 
         data = safe_get(url, params)
-        if not data:
+        if not data or len(data) < 4:
             return None
 
-        d = data[0]
+        r0 = data[0].get("revenue", 0)
+        r1 = data[1].get("revenue", 0)
+        r2 = data[2].get("revenue", 0)
+        r3 = data[3].get("revenue", 0)
 
-        mcap = d.get("mktCap")
-        price = d.get("price")
-        sector = d.get("sector")
-
-        if not mcap or not price:
+        if min(r0, r1, r2, r3) <= 0:
             return None
 
-        if mcap > 10_000_000_000:
-            return None
+        # YoY
+        yoy = (r0 - r2) / r2
+
+        # QoQ acceleration
+        qoq_now = (r0 - r1) / r1
+        qoq_prev = (r1 - r2) / r2
+        accel = qoq_now - qoq_prev
 
         return {
-            "ticker": ticker,
-            "mcap": mcap,
-            "price": price,
-            "sector": sector
+            "yoy": yoy,
+            "accel": accel
         }
 
     except:
@@ -79,70 +77,48 @@ def fetch_base(ticker):
 
 
 # =========================
-# GROWTH
+# SCORE v6（核心）
 # =========================
-def fetch_growth(ticker):
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
-        params = {"limit": 2, "apikey": FMP_API_KEY}
-
-        data = safe_get(url, params)
-
-        if not data or len(data) < 2:
-            return None
-
-        rev1 = data[0].get("revenue", 0)
-        rev0 = data[1].get("revenue", 0)
-
-        if rev0 <= 0:
-            return None
-
-        return (rev1 - rev0) / rev0
-
-    except:
-        return None
-
-
-# =========================
-# SCORE
-# =========================
-def score(d):
+def score_v6(d):
     s = 0
 
-    if d["mcap"] < 300_000_000:
+    yoy = d["yoy"]
+    accel = d["accel"]
+
+    # ① 成長
+    if yoy > 0.5:
         s += 5
-    elif d["mcap"] < 1_000_000_000:
+    elif yoy > 0.3:
+        s += 4
+    elif yoy > 0.15:
         s += 3
-    else:
+    elif yoy > 0.05:
         s += 1
 
-    rev = d.get("revenue_growth")
-    if rev is not None:
-        if rev > 0.4:
-            s += 5
-        elif rev > 0.2:
-            s += 3
-        elif rev > 0.05:
-            s += 1
+    # ② 加速（最重要）
+    if accel > 0.2:
+        s += 6
+    elif accel > 0.1:
+        s += 4
+    elif accel > 0.05:
+        s += 2
 
-    if d["price"] > 10:
-        s += 1
-
-    if d.get("sector") in ["Technology", "Healthcare"]:
-        s += 1
+    # ③ 最低ライン（ゴミ除去）
+    if yoy < 0.05:
+        s -= 3
 
     return s
 
 
 # =========================
-# SUCCESS NOTIFY
+# NOTIFY
 # =========================
 def notify(df, stats):
     if not WEBHOOK_URL:
         print(df)
         return
 
-    msg = "🚀 GrowthRadar v5.7\n\n"
+    msg = "🚀 GrowthRadar v6 (Acceleration)\n\n"
 
     if df.empty:
         msg += "No candidates\n\n"
@@ -150,41 +126,16 @@ def notify(df, stats):
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
-                f"MCap:{round(r['mcap']/1e9,2)}B "
-                f"| Rev:{r.get('revenue_growth',0):.2f}\n\n"
+                f"YoY:{r['yoy']:.2f} | Accel:{r['accel']:.2f}\n\n"
             )
 
     msg += (
         "--- Stats ---\n"
         f"Checked: {stats['checked']}\n"
-        f"Base OK: {stats['base_ok']}\n"
-        f"Growth OK: {stats['growth_ok']}\n"
+        f"Valid: {stats['valid']}\n"
     )
 
     requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
-
-
-# =========================
-# ERROR NOTIFY
-# =========================
-def notify_error(e, stats):
-    if not WEBHOOK_URL:
-        print("ERROR:", e)
-        return
-
-    msg = (
-        "🔥 GrowthRadar ERROR\n\n"
-        f"{str(e)}\n\n"
-        "--- Stats ---\n"
-        f"Checked: {stats['checked']}\n"
-        f"Base OK: {stats['base_ok']}\n"
-        f"Growth OK: {stats['growth_ok']}\n"
-    )
-
-    try:
-        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
-    except:
-        print("Discord送信すら失敗")
 
 
 # =========================
@@ -198,44 +149,61 @@ def main(stats):
     for t in tickers[:300]:
         stats["checked"] += 1
 
-        base = fetch_base(t)
-        if not base:
+        g = fetch_growth_accel(t)
+        if not g:
             continue
 
-        stats["base_ok"] += 1
+        stats["valid"] += 1
 
-        g = fetch_growth(t)
-        if g is not None:
-            base["revenue_growth"] = g
-            stats["growth_ok"] += 1
+        d = {
+            "ticker": t,
+            "yoy": g["yoy"],
+            "accel": g["accel"]
+        }
 
-        base["score"] = score(base)
-        results.append(base)
+        d["score"] = score_v6(d)
+        results.append(d)
 
         if stats["checked"] % 50 == 0:
             print(f"Processed: {stats['checked']}")
 
-    print(f"Base通過: {stats['base_ok']}")
-    print(f"Growth取得: {stats['growth_ok']}")
-
     df = pd.DataFrame(results)
 
     if not df.empty:
-        df = df.sort_values("score", ascending=False).head(20)
+        df = df.sort_values("score", ascending=False).head(15)
 
     notify(df, stats)
 
 
 # =========================
-# WRAPPER（最重要）
+# ERROR NOTIFY
+# =========================
+def notify_error(e, stats):
+    if not WEBHOOK_URL:
+        print(e)
+        return
+
+    msg = (
+        "🔥 GrowthRadar v6 ERROR\n\n"
+        f"{str(e)}\n\n"
+        f"Checked: {stats['checked']}\n"
+    )
+
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
+    except:
+        print("Discord failure")
+
+
+# =========================
+# WRAPPER
 # =========================
 def main_wrapper():
-    stats = {"checked": 0, "base_ok": 0, "growth_ok": 0}
+    stats = {"checked": 0, "valid": 0}
 
     try:
         main(stats)
     except Exception as e:
-        print("FATAL:", e)
         notify_error(e, stats)
 
 
