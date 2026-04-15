@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
 import time
 
 # =========================
@@ -11,202 +12,208 @@ import time
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 # =========================
-# CONFIG
+# CONFIG (Aggressive Settings)
 # =========================
-MAX_WORKERS = 3  # yfinanceのブロックを避けるため少し下げる
-PHASE2_LIMIT = 500
-FINAL_LIMIT = 150 # 確実性を高めるため、一度に追う数を絞る
+MAX_WORKERS = 10  # セッション共有により高速化
+SCAN_LIMIT = 1500
+FINAL_LIMIT = 300
 
-MIN_REVENUE = 1_000_000 # 10Mから1Mへ緩和（データの単位ミス対策）
-MIN_MCAP = 50_000_000  # 緩和
-MAX_MCAP = 5_000_000_000
-MIN_YOY = -0.1 # 一旦マイナスも許容して「動くか」を確認
-
-# =========================
-# TICKERS (NASDAQリスト取得)
-# =========================
-def get_tickers():
-    try:
-        url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
-        df = pd.read_csv(url)
-        return df["Symbol"].dropna().tolist()
-    except:
-        return ["AAPL", "TSLA", "NVDA", "MSFT", "AMD", "GOOGL", "META"] # 失敗時のバックアップ
+MIN_MCAP = 50_000_000
+MAX_MCAP = 3_000_000_000  # 小型株の定義をより厳格に
+MIN_SCORE = 10            # 妥協を許さない基準値
 
 # =========================
-# Phase1（軽い価格チェック）
+# CORE LOGIC
 # =========================
-def pre_filter(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        # 5日分取得
-        hist = t.history(period="7d")
-        if hist.empty or len(hist) < 2: return None
 
-        price = hist["Close"].iloc[-1]
-        vol = hist["Volume"].mean()
+class ButcherScanner:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
-        if price < 1 or vol < 50_000: return None # 出来高条件を少し緩和
+    def get_tickers(self):
+        """NASDAQ上場銘柄を取得（バックアップ付き）"""
+        try:
+            url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
+            df = pd.read_csv(url)
+            return df["Symbol"].dropna().tolist()
+        except:
+            return ["AAPL", "NVDA", "TSLA", "AMD", "META", "UPST", "PLTR", "IONQ", "RKLB"]
 
-        mom = (price - hist["Close"].iloc[0]) / hist["Close"].iloc[0]
-        return {"ticker": ticker, "mom": mom, "price": price}
-    except:
-        return None
+    def pre_filter(self, ticker):
+        """Phase1: 価格、出来高、短期トレンドの最低条件"""
+        try:
+            t = yf.Ticker(ticker, session=self.session)
+            hist = t.history(period="10d")
+            if hist.empty or len(hist) < 5: return None
 
-# =========================
-# Phase3（財務データ取得：ここが鬼門）
-# =========================
-def fetch_data(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        
-        # 1. 財務諸表の取得
-        fin = t.quarterly_financials
-        if fin is None or fin.empty:
+            price = hist["Close"].iloc[-1]
+            avg_vol = hist["Volume"].mean()
+            
+            # ペニーストックと不人気株を即排除
+            if price < 2 or avg_vol < 100_000: return None
+            
+            # 短期モメンタム (5日移動平均との乖離)
+            ma5 = hist["Close"].tail(5).mean()
+            if price < ma5: return None # 下降局面は無視
+
+            return {"ticker": ticker, "price": price}
+        except:
             return None
 
-        # インデックス名を正規化（大文字小文字スペースを無視）
-        fin.index = fin.index.str.replace(' ', '').str.upper()
-        target_label = "TOTALREVENUE"
-
-        if target_label not in fin.index:
-            # 別のラベルを探す（Operating Revenueなど）
-            alt_labels = ["OPERATINGREVENUE", "TOTALOPERATINGREVENUE"]
-            for alt in alt_labels:
-                if alt in fin.index:
-                    target_label = alt
-                    break
-            else:
-                return None
-
-        rev = fin.loc[target_label].dropna().values
-        if len(rev) < 2: return None # 2四半期あればYoY計算可能とする
-
-        r0 = rev[0] # 直近
-        r1 = rev[1] if len(rev) > 1 else r0
-        r2 = rev[2] if len(rev) > 2 else r1
-
-        yoy = (r0 - r2) / r2 if len(rev) > 2 and r2 > 0 else (r0 - r1) / r1
-
-        # 2. 基本情報（時価総額）
-        # t.info は重いので、fast_info を使用（yfの最新版で推奨）
+    def fetch_deep_data(self, ticker):
+        """Phase3: 財務の質と真のモメンタムを解剖"""
         try:
-            mcap = t.fast_info.market_cap
+            t = yf.Ticker(ticker, session=self.session)
+            
+            # 1. 財務 (売上成長 + キャッシュフロー)
+            yoy, ocf_ratio = 0, 0
+            try:
+                # 四半期財務
+                fin = t.quarterly_financials
+                cash = t.quarterly_cashflow
+                
+                if fin is not None and not fin.empty:
+                    fin.index = fin.index.str.replace(' ', '').str.upper()
+                    if "TOTALREVENUE" in fin.index:
+                        rev = fin.loc["TOTALREVENUE"].dropna().values
+                        if len(rev) >= 2 and rev[1] > 0:
+                            yoy = (rev[0] - rev[1]) / rev[1]
+
+                if cash is not None and not cash.empty:
+                    cash.index = cash.index.str.replace(' ', '').str.upper()
+                    if "OPERATINGCASHFLOW" in cash.index:
+                        ocf = cash.loc["OPERATINGCASHFLOW"].dropna().values
+                        # 売上高に対する営業CFの割合（健全性指標）
+                        if len(ocf) > 0 and len(rev) > 0 and rev[0] > 0:
+                            ocf_ratio = ocf[0] / rev[0]
+            except: pass
+
+            if yoy <= 0: return None # 成長してないなら話にならない
+
+            # 2. 時価総額の厳密チェック
+            mcap = 0
+            try:
+                mcap = t.fast_info.market_cap
+                if mcap < MIN_MCAP or mcap > MAX_MCAP: return None
+            except: return None # Mcap不明はリスクのため排除
+
+            # 3. テクニカル分析 (3ヶ月 & 1ヶ月)
+            hist = t.history(period="4mo")
+            if len(hist) < 60: return None
+            
+            p_now = hist["Close"].iloc[-1]
+            p_1m = hist["Close"].iloc[-20]
+            p_3m = hist["Close"].iloc[-60]
+
+            mom_3m = (p_now - p_3m) / p_3m
+            mom_1m = (p_now - p_1m) / p_1m
+            
+            # 「落ちてくるナイフ」排除：1ヶ月で15%以上掘ってるなら除外
+            if mom_1m < -0.15: return None
+
+            # 出来高の質：直近3日の平均 / 20日平均
+            vol_spike = hist["Volume"].tail(3).mean() / (hist["Volume"].tail(20).mean() + 1)
+
+            return {
+                "ticker": ticker,
+                "yoy": yoy,
+                "ocf_ratio": ocf_ratio,
+                "mom_3m": mom_3m,
+                "mom_1m": mom_1m,
+                "vol_spike": vol_spike,
+                "mcap": mcap,
+                "price": p_now
+            }
         except:
-            mcap = 0 # 取れない場合は後でフィルタ
+            return None
 
-        # 3. モメンタム再計算（3ヶ月）
-        hist = t.history(period="3mo")
-        if hist.empty:
-            momentum = 0
-            vol_trend = 1
+    def calculate_score(self, d):
+        """妥協なきスコアリング"""
+        s = 0
+        
+        # 成長性 (YoY)
+        if d["yoy"] > 1.0: s += 8   # 爆速
+        elif d["yoy"] > 0.4: s += 6
+        elif d["yoy"] > 0.15: s += 3
+
+        # 現金創出力 (OCF Ratio)
+        if d["ocf_ratio"] > 0.2: s += 4 # 超健全
+        elif d["ocf_ratio"] > 0: s += 1
+        else: s -= 5 # 現金が流出している赤字垂れ流しは減点
+
+        # モメンタムの質
+        if d["mom_1m"] > 0 and d["mom_3m"] > 0:
+            s += 3 # 上昇トレンド継続
+        if d["mom_1m"] > d["mom_3m"]:
+            s += 3 # 上昇が加速している
+
+        # 出来高の異常
+        if d["vol_spike"] > 2.0: s += 5 # 機関投資家の買いの可能性
+        elif d["vol_spike"] > 1.3: s += 2
+
+        # 時価総額ボーナス
+        if d["mcap"] < 300_000_000: s += 2 # 超小型プレミアム
+
+        return s
+
+    def run(self):
+        start_time = time.time()
+        stats = {"p1": 0, "p3_in": 0, "valid": 0}
+        
+        print("--- Execution Started ---")
+        tickers = self.get_tickers()
+        random.shuffle(tickers)
+        
+        # Phase 1
+        p1_list = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(self.pre_filter, t): t for t in tickers[:SCAN_LIMIT]}
+            for f in as_completed(futures):
+                res = f.result()
+                if res: p1_list.append(res)
+        
+        stats["p1"] = len(p1_list)
+        
+        # Phase 2: Sort
+        # 単純なMomではなく直近の強さで足切り
+        p2_list = sorted(p1_list, key=lambda x: x.get('price', 0), reverse=True)[:FINAL_LIMIT]
+        final_tickers = [x["ticker"] for x in p2_list]
+        stats["p3_in"] = len(final_tickers)
+
+        # Phase 3
+        results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(self.fetch_deep_data, t): t for t in final_tickers}
+            for f in as_completed(futures):
+                res = f.result()
+                if res:
+                    res["score"] = self.calculate_score(res)
+                    if res["score"] >= MIN_SCORE:
+                        results.append(res)
+                        stats["valid"] += 1
+
+        # Display / Notify
+        df = pd.DataFrame(results)
+        if not df.empty:
+            df = df.sort_values("score", ascending=False).head(10)
+            self.notify(df, stats)
         else:
-            momentum = (hist["Close"].iloc[-1] - hist["Close"].iloc[0]) / hist["Close"].iloc[0]
-            vol_now = hist["Volume"].tail(5).mean()
-            vol_prev = hist["Volume"].head(5).mean()
-            vol_trend = vol_now / (vol_prev + 1)
+            self.notify(pd.DataFrame(), stats)
+            
+        print(f"--- Finished in {time.time() - start_time:.1f}s ---")
 
-        return {
-            "ticker": ticker,
-            "yoy": yoy,
-            "accel": (r0/r1) - (r1/r2) if r1>0 and r2>0 else 0,
-            "momentum": momentum,
-            "vol_trend": vol_trend,
-            "mcap": mcap
-        }
-    except Exception as e:
-        # print(f"Error {ticker}: {e}") # デバッグ用
-        return None
-
-# =========================
-# SCORE
-# =========================
-def score(d):
-    s = 0
-    if d["yoy"] > 0.3: s += 5
-    elif d["yoy"] > 0.1: s += 3
-    
-    if d["momentum"] > 0.2: s += 4
-    elif d["momentum"] > 0: s += 1
-    
-    if d["vol_trend"] > 1.2: s += 2
-    return s
-
-# =========================
-# NOTIFY
-# =========================
-def notify(df, stats):
-    header = "🚀 **GrowthRadar v8.5 (Robust)**\n"
-    if df.empty:
-        msg = header + "⚠️ No candidates found. Financial data might be restricted by Yahoo."
-    else:
-        msg = header
-        for _, r in df.iterrows():
-            msg += (
-                f"**{r['ticker']}** | Score:{r['score']}\n"
-                f"YoY:{r['yoy']:.1%}, Mom:{r['momentum']:.1%}, Vol:{r['vol_trend']:.1%}\n\n"
-            )
-
-    msg += (
-        "```"
-        f"Phase1: {stats['phase1']}\n"
-        f"Checked: {stats['checked']}\n"
-        f"Valid: {stats['valid']}\n"
-        "```"
-    )
-
-    if WEBHOOK_URL:
-        requests.post(WEBHOOK_URL, json={"content": msg})
-    else:
-        print(msg)
-
-# =========================
-# MAIN
-# =========================
-def main():
-    start_time = time.time()
-    stats = {"phase1": 0, "checked": 0, "valid": 0}
-    
-    all_tickers = get_tickers()
-    # 処理時間を考慮し、最初は全件ではなくシャッフルして一部を狙う
-    import random
-    random.shuffle(all_tickers)
-    tickers_to_scan = all_tickers[:1000] 
-
-    # Phase 1: Price/Vol Filter
-    phase1_results = []
-    print("Phase 1 Scanning...")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(pre_filter, t): t for t in tickers_to_scan}
-        for f in as_completed(futures):
-            res = f.result()
-            if res: phase1_results.append(res)
-    
-    stats["phase1"] = len(phase1_results)
-    
-    # Phase 2: Sort by Momentum
-    phase1_sorted = sorted(phase1_results, key=lambda x: x["mom"], reverse=True)
-    tickers_final = [x["ticker"] for x in phase1_sorted[:FINAL_LIMIT]]
-
-    # Phase 3: Deep Fetch
-    results = []
-    print(f"Phase 3 Checking {len(tickers_final)} tickers...")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(fetch_data, t): t for t in tickers_final}
-        for f in as_completed(futures):
-            stats["checked"] += 1
-            res = f.result()
-            if res:
-                stats["valid"] += 1
-                res["score"] = score(res)
-                results.append(res)
-
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values("score", ascending=False).head(10)
-
-    notify(df, stats)
-    print(f"Total time: {time.time() - start_time:.1f}s")
-
-if __name__ == "__main__":
-    main()
+    def notify(self, df, stats):
+        msg = "🔪 **GrowthRadar v9.0 [The Butcher]**\n\n"
+        if df.empty:
+            msg += "❌ No high-quality survivors today."
+        else:
+            for _, r in df.iterrows():
+                health = "✅" if r['ocf_ratio'] > 0 else "🚨"
+                msg += (
+                    f"**{r['ticker']}** | Score: **{r['score']}**\n"
+                    f"RevYoY: {r['yoy']:.1%} {health} OCF/Rev: {r['ocf_ratio']:.1%}\n"
+                    f"Mom1M: {r['mom_1m']:.1%} | Vol: x{r['vol_spike']:.1f}\n\n"
+                )
+        
+        msg += f"
