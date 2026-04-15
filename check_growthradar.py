@@ -21,13 +21,13 @@ def get_tickers():
     df = pd.read_csv(url)
 
     tickers = df["Symbol"].dropna().tolist()
-    print(f"Tickers loaded: {len(tickers)}")
 
+    print(f"Tickers loaded: {len(tickers)}")
     return tickers
 
 
 # =========================
-# FETCH
+# FETCH (FMP fundamentals)
 # =========================
 def fetch(ticker):
     try:
@@ -37,20 +37,13 @@ def fetch(ticker):
         if not isinstance(r, list) or not r:
             return None
 
-        d = r[0]
-
-        mcap = d.get("mktCap")
-        price = d.get("price")
-        sector = d.get("sector")
-
-        if not mcap or not price:
-            return None
+        p = r[0]
 
         return {
             "ticker": ticker,
-            "mcap": mcap,
-            "price": price,
-            "sector": sector
+            "mcap": p.get("mktCap"),
+            "price": p.get("price"),
+            "sector": p.get("sector")
         }
 
     except:
@@ -58,28 +51,78 @@ def fetch(ticker):
 
 
 # =========================
-# SCORE
+# EXTRA FUNDAMENTALS
+# =========================
+def fetch_growth(ticker):
+    try:
+        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=2&apikey={FMP_API_KEY}"
+        r = requests.get(url, timeout=10).json()
+
+        if not isinstance(r, list) or len(r) < 2:
+            return {}
+
+        latest = r[0]
+        prev = r[1]
+
+        rev_growth = None
+        if prev.get("revenue") and latest.get("revenue"):
+            rev_growth = (latest["revenue"] - prev["revenue"]) / abs(prev["revenue"])
+
+        return {
+            "revenue_growth": rev_growth
+        }
+
+    except:
+        return {}
+
+
+# =========================
+# SCORE v3（テンバガー型）
 # =========================
 def score(d):
     s = 0
 
-    if d["mcap"] < 500_000_000:
+    mcap = d.get("mcap", 0)
+
+    # SIZE
+    if mcap < 300_000_000:
+        s += 6
+    elif mcap < 1_000_000_000:
         s += 5
-    elif d["mcap"] < 1_000_000_000:
-        s += 4
-    elif d["mcap"] < 5_000_000_000:
+    elif mcap < 5_000_000_000:
         s += 2
     else:
+        s += 0
+
+    # GROWTH
+    rev = d.get("revenue_growth")
+
+    if rev is not None:
+        if rev > 0.5:
+            s += 6
+        elif rev > 0.3:
+            s += 5
+        elif rev > 0.2:
+            s += 3
+        elif rev > 0.1:
+            s += 1
+
+    # MOMENTUM
+    price = d.get("price", 0)
+    if price > 50:
+        s += 2
+    elif price > 20:
         s += 1
 
-    if d["sector"] in ["Technology", "Healthcare"]:
+    # SECTOR
+    if d.get("sector") in ["Technology", "Healthcare", "Communication Services"]:
         s += 1
 
     return s
 
 
 # =========================
-# NOTIFY
+# DISCORD
 # =========================
 def notify(df, total, processed, valid):
     if not WEBHOOK_URL:
@@ -87,27 +130,24 @@ def notify(df, total, processed, valid):
         return
 
     if df.empty:
-        msg = "⚠️ GrowthRadar v2: No candidates\n\n"
+        msg = "⚠️ GrowthRadar v3: No candidates\n\n"
     else:
-        msg = "🚀 GrowthRadar v2\n\n"
-
+        msg = "🚀 GrowthRadar v3 (Tenbagger Mode)\n\n"
         for _, r in df.iterrows():
             msg += (
                 f"{r['ticker']} | Score:{r['score']}\n"
-                f"MCap:{r['mcap_b']}B | Sector:{r['sector']}\n\n"
+                f"MCap:{r['mcap_b']}B | Sector:{r['sector']}\n"
+                f"RevGrowth:{r.get('revenue_growth', None)}\n\n"
             )
 
     msg += (
         "--------------------\n"
-        f"Total tickers: {total}\n"
+        f"Total: {total}\n"
         f"Processed: {processed}\n"
         f"Valid: {valid}\n"
     )
 
-    try:
-        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
-    except Exception as e:
-        print("Webhook error:", e)
+    requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
 
 
 # =========================
@@ -131,16 +171,19 @@ def main():
             if processed % 500 == 0:
                 print(f"Processed: {processed}/{total}")
 
-            d = f.result()
-            if not d:
+            base = f.result()
+            if not base:
                 continue
+
+            growth = fetch_growth(base["ticker"])
+            base.update(growth)
 
             valid += 1
 
-            d["score"] = score(d)
-            d["mcap_b"] = round(d["mcap"] / 1e9, 2)
+            base["score"] = score(base)
+            base["mcap_b"] = round(base.get("mcap", 0) / 1e9, 2)
 
-            results.append(d)
+            results.append(base)
 
     df = pd.DataFrame(results)
 
