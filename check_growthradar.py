@@ -17,11 +17,11 @@ MAX_WORKERS = 5
 PHASE2_LIMIT = 2500
 FINAL_LIMIT = 1000
 
-MIN_REVENUE = 30_000_000   # ← 緩和
-MIN_MCAP = 100_000_000     # ← 緩和
+MIN_REVENUE = 10_000_000
+MIN_MCAP = 100_000_000
 MAX_MCAP = 5_000_000_000
 
-MIN_YOY = 0.05             # ← 緩和
+MIN_YOY = 0.03   # さらに緩和
 
 # =========================
 # TICKERS
@@ -32,7 +32,7 @@ def get_tickers():
     return df["Symbol"].dropna().tolist()
 
 # =========================
-# Phase1（緩和）
+# Phase1（軽い）
 # =========================
 def pre_filter(ticker):
     try:
@@ -45,14 +45,12 @@ def pre_filter(ticker):
         price = hist["Close"].iloc[-1]
         vol = hist["Volume"].mean()
 
-        # 緩和
         if price < 1:
             return None
 
         if vol < 100_000:
             return None
 
-        # モメンタムは取得だけ（除外しない）
         price_5d = hist["Close"].iloc[0]
         mom = (price - price_5d) / price_5d
 
@@ -65,7 +63,7 @@ def pre_filter(ticker):
         return None
 
 # =========================
-# Phase3（重い）
+# Phase3（現実対応）
 # =========================
 def fetch_data(ticker):
     try:
@@ -76,27 +74,27 @@ def fetch_data(ticker):
             return None
 
         rev = fin.loc["Total Revenue"].dropna().values
-        if len(rev) < 4:
+        if len(rev) < 3:
             return None
 
-        r0, r1, r2, r3 = rev[:4]
+        r0, r1, r2 = rev[:3]
 
-        if min(r0, r1, r2, r3) <= 0:
+        if min(r0, r1, r2) <= 0:
             return None
 
         if r0 < MIN_REVENUE:
             return None
 
         yoy = (r0 - r2) / r2
+
+        # 成長だけは最低限維持
         if yoy < MIN_YOY:
             return None
 
+        # accelは取得だけ
         qoq_now = (r0 - r1) / r1
         qoq_prev = (r1 - r2) / r2
         accel = qoq_now - qoq_prev
-
-        if accel <= 0 or accel > 1.2:  # ← 少し緩和
-            return None
 
         info = t.info
         mcap = info.get("marketCap", 0)
@@ -131,23 +129,22 @@ def fetch_data(ticker):
         return None
 
 # =========================
-# SCORE（微調整）
+# SCORE（現実版）
 # =========================
 def score(d):
     s = 0
 
-    # 成長
+    # 成長（重要度高）
     if d["yoy"] > 0.5: s += 5
     elif d["yoy"] > 0.3: s += 4
     elif d["yoy"] > 0.1: s += 3
-    else: s += 1
+    else: s += 2
 
-    # 加速
-    if d["accel"] > 0.3: s += 4
-    elif d["accel"] > 0.15: s += 3
-    else: s += 1
+    # accel（ボーナス扱い）
+    if d["accel"] > 0.3: s += 3
+    elif d["accel"] > 0: s += 1
 
-    # モメンタム（重要：除外しない）
+    # モメンタム
     if d["momentum"] > 0.5: s += 4
     elif d["momentum"] > 0.2: s += 3
     elif d["momentum"] > 0: s += 1
@@ -162,10 +159,10 @@ def score(d):
 # NOTIFY
 # =========================
 def notify(df, stats):
-    msg = "🚀 GrowthRadar v8.3 (Live)\n\n"
+    msg = "🚀 GrowthRadar v8.4 (Stable)\n\n"
 
     if df.empty:
-        msg += "⚠️ No strict candidates → fallback used\n\n"
+        msg += "⚠️ No candidates even after fallback\n\n"
 
     for _, r in df.iterrows():
         msg += (
@@ -232,10 +229,9 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # ▼ fallback（重要）
-    if df.empty:
-        print("Fallback: relaxing filters...")
-        df = pd.DataFrame(results)  # 全部出す
+    # fallback完全保証
+    if df.empty and results:
+        df = pd.DataFrame(results)
 
     if not df.empty:
         df = df.sort_values("score", ascending=False).head(15)
