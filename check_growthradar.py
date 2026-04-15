@@ -13,12 +13,13 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 # CONFIG
 # =========================
 MAX_WORKERS = 5
-SCAN_LIMIT = 600
+
+PHASE2_LIMIT = 2000   # 中間
+FINAL_LIMIT = 1000    # 最終スキャン
 
 MIN_REVENUE = 50_000_000
 MIN_MCAP = 200_000_000
 MAX_MCAP = 5_000_000_000
-
 MIN_YOY = 0.10
 
 # =========================
@@ -30,7 +31,7 @@ def get_tickers():
     return df["Symbol"].dropna().tolist()
 
 # =========================
-# LIGHT FILTER（高速）
+# Phase1（超軽量）
 # =========================
 def pre_filter(ticker):
     try:
@@ -43,25 +44,34 @@ def pre_filter(ticker):
         price = hist["Close"].iloc[-1]
         vol = hist["Volume"].mean()
 
-        # ゴミ除去
         if price < 2:
             return None
 
         if vol < 300_000:
             return None
 
-        return ticker
+        # 軽モメンタム
+        price_5d = hist["Close"].iloc[0]
+        mom = (price - price_5d) / price_5d
+
+        if mom < -0.05:
+            return None
+
+        return {
+            "ticker": ticker,
+            "mom": mom
+        }
+
     except:
         return None
 
 # =========================
-# MAIN FETCH（重い）
+# Phase3（重い）
 # =========================
 def fetch_data(ticker):
     try:
         t = yf.Ticker(ticker)
 
-        # --- 財務 ---
         fin = t.quarterly_financials
         if fin is None or fin.empty or "Total Revenue" not in fin.index:
             return None
@@ -78,7 +88,6 @@ def fetch_data(ticker):
         if r0 < MIN_REVENUE:
             return None
 
-        # --- 成長 ---
         yoy = (r0 - r2) / r2
         if yoy < MIN_YOY:
             return None
@@ -90,14 +99,12 @@ def fetch_data(ticker):
         if accel <= 0 or accel > 1.0:
             return None
 
-        # --- 市場データ ---
         info = t.info
         mcap = info.get("marketCap", 0)
 
         if not mcap or mcap < MIN_MCAP or mcap > MAX_MCAP:
             return None
 
-        # --- モメンタム（除外しない） ---
         hist = t.history(period="3mo")
 
         if hist is None or hist.empty or len(hist) < 20:
@@ -110,11 +117,7 @@ def fetch_data(ticker):
 
             vol_now = hist["Volume"].tail(5).mean()
             vol_prev = hist["Volume"].head(5).mean()
-
-            if vol_prev == 0:
-                vol_trend = 1
-            else:
-                vol_trend = vol_now / vol_prev
+            vol_trend = vol_now / vol_prev if vol_prev else 1
 
         return {
             "ticker": ticker,
@@ -144,7 +147,7 @@ def score(d):
     elif d["accel"] > 0.15: s += 3
     else: s += 2
 
-    # モメンタム（加点のみ）
+    # モメンタム
     if d["momentum"] > 0.5: s += 4
     elif d["momentum"] > 0.2: s += 3
     elif d["momentum"] > 0: s += 1
@@ -159,7 +162,7 @@ def score(d):
 # NOTIFY
 # =========================
 def notify(df, stats):
-    msg = "🚀 GrowthRadar v8.1 (Daily)\n\n"
+    msg = "🚀 GrowthRadar v8.2 (1000 Scan)\n\n"
 
     if df.empty:
         msg += "No strong candidates → showing best available\n\n"
@@ -173,8 +176,9 @@ def notify(df, stats):
 
     msg += (
         "--- Stats ---\n"
+        f"Phase1 Pass: {stats['phase1']}\n"
+        f"Phase2 Used: {stats['phase2']}\n"
         f"Checked: {stats['checked']}\n"
-        f"PreFiltered: {stats['prefilter']}\n"
         f"Valid: {stats['valid']}\n"
     )
 
@@ -184,7 +188,7 @@ def notify(df, stats):
         print(msg)
 
 # =========================
-# ERROR NOTIFY
+# ERROR
 # =========================
 def notify_error(e, stats):
     msg = f"🔥 ERROR\n{str(e)}\nChecked:{stats['checked']}"
@@ -194,34 +198,38 @@ def notify_error(e, stats):
             requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
         except:
             print("Discord送信失敗")
-    else:
-        print(msg)
 
 # =========================
 # MAIN
 # =========================
-def main(stats):
+def main():
+    stats = {"phase1": 0, "phase2": 0, "checked": 0, "valid": 0}
+
     tickers = get_tickers()
 
-    # --- Phase1: 軽フィルタ ---
-    filtered = []
+    # ---------- Phase1 ----------
+    phase1 = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(pre_filter, t): t for t in tickers}
-
         for f in as_completed(futures):
             res = f.result()
             if res:
-                filtered.append(res)
+                phase1.append(res)
 
-    stats["prefilter"] = len(filtered)
+    stats["phase1"] = len(phase1)
 
-    # --- Phase2: 上位だけスキャン ---
-    filtered = filtered[:SCAN_LIMIT]
+    # ---------- Phase2 ----------
+    phase1_sorted = sorted(phase1, key=lambda x: x["mom"], reverse=True)
+    phase2 = phase1_sorted[:PHASE2_LIMIT]
+
+    stats["phase2"] = len(phase2)
+
+    # ---------- Phase3 ----------
+    tickers_final = [x["ticker"] for x in phase2[:FINAL_LIMIT]]
 
     results = []
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(fetch_data, t): t for t in filtered}
+        futures = {ex.submit(fetch_data, t): t for t in tickers_final}
 
         for f in as_completed(futures):
             stats["checked"] += 1
@@ -245,18 +253,10 @@ def main(stats):
     notify(df, stats)
 
 # =========================
-# WRAPPER
-# =========================
-def main_wrapper():
-    stats = {"checked": 0, "valid": 0, "prefilter": 0}
-
-    try:
-        main(stats)
-    except Exception as e:
-        notify_error(e, stats)
-
-# =========================
 # ENTRY
 # =========================
 if __name__ == "__main__":
-    main_wrapper()
+    try:
+        main()
+    except Exception as e:
+        notify_error(e, {"checked": 0})
