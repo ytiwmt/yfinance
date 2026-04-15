@@ -5,7 +5,7 @@ import json
 import os
 import numpy as np
 
-webhook_url_yfinance = os.getenv("WEBHOOK_URL_YFINANCE")
+webhook_url_yfinance = os.getenv("WEBHOOK_URL_YIELDLOCATION")
 
 # -----------------------------
 # S&P500取得
