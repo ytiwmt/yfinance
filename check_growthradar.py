@@ -1,7 +1,6 @@
 import os
 import requests
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # ENV
@@ -14,109 +13,112 @@ if not FMP_API_KEY:
 
 
 # =========================
-# UNIVERSE
+# STEP1: SCREENER（1 call）
 # =========================
-def get_tickers():
-    url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
-    df = pd.read_csv(url)
+def get_candidates():
+    url = "https://financialmodelingprep.com/api/v3/stock-screener"
 
-    tickers = df["Symbol"].dropna().tolist()
+    params = {
+        "marketCapLowerThan": 3_000_000_000,
+        "priceMoreThan": 3,
+        "exchange": "NASDAQ",
+        "limit": 1000,
+        "apikey": FMP_API_KEY
+    }
 
-    print(f"Tickers loaded: {len(tickers)}")
-    return tickers
+    r = requests.get(url, params=params, timeout=10).json()
+
+    print(f"Screener fetched: {len(r)}")
+
+    return r
 
 
 # =========================
-# FETCH (FMP fundamentals)
+# STEP2: 上位抽出（構造圧縮）
 # =========================
-def fetch(ticker):
+def select_top(candidates):
+    df = pd.DataFrame(candidates)
+
+    # 安全処理
+    df = df.dropna(subset=["marketCap", "price"])
+
+    # 小型優先でソート
+    df = df.sort_values("marketCap")
+
+    # 上位200だけ
+    df = df.head(200)
+
+    print(f"Selected for growth scan: {len(df)}")
+
+    return df.to_dict("records")
+
+
+# =========================
+# STEP3: GROWTH取得（最大200 calls）
+# =========================
+def fetch_growth(ticker):
     try:
-        url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
-        r = requests.get(url, timeout=10).json()
+        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
+        params = {
+            "limit": 2,
+            "apikey": FMP_API_KEY
+        }
 
-        if not isinstance(r, list) or not r:
+        r = requests.get(url, params=params, timeout=5).json()
+
+        if not isinstance(r, list) or len(r) < 2:
             return None
 
-        p = r[0]
+        rev1 = r[0].get("revenue", 0)
+        rev0 = r[1].get("revenue", 0)
 
-        return {
-            "ticker": ticker,
-            "mcap": p.get("mktCap"),
-            "price": p.get("price"),
-            "sector": p.get("sector")
-        }
+        if rev0 <= 0:
+            return None
+
+        return (rev1 - rev0) / rev0
 
     except:
         return None
 
 
 # =========================
-# EXTRA FUNDAMENTALS
-# =========================
-def fetch_growth(ticker):
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=2&apikey={FMP_API_KEY}"
-        r = requests.get(url, timeout=10).json()
-
-        if not isinstance(r, list) or len(r) < 2:
-            return {}
-
-        latest = r[0]
-        prev = r[1]
-
-        rev_growth = None
-        if prev.get("revenue") and latest.get("revenue"):
-            rev_growth = (latest["revenue"] - prev["revenue"]) / abs(prev["revenue"])
-
-        return {
-            "revenue_growth": rev_growth
-        }
-
-    except:
-        return {}
-
-
-# =========================
-# SCORE v3（テンバガー型）
+# SCORE v5（実戦）
 # =========================
 def score(d):
     s = 0
 
-    mcap = d.get("mcap", 0)
+    mcap = d["marketCap"]
+    price = d["price"]
 
     # SIZE
-    if mcap < 300_000_000:
+    if mcap < 200_000_000:
+        s += 7
+    elif mcap < 500_000_000:
         s += 6
     elif mcap < 1_000_000_000:
-        s += 5
-    elif mcap < 5_000_000_000:
-        s += 2
+        s += 4
     else:
-        s += 0
+        s += 2
 
-    # GROWTH
+    # GROWTH（主軸）
     rev = d.get("revenue_growth")
-
     if rev is not None:
         if rev > 0.5:
-            s += 6
+            s += 8
         elif rev > 0.3:
-            s += 5
-        elif rev > 0.2:
-            s += 3
-        elif rev > 0.1:
-            s += 1
+            s += 6
+        elif rev > 0.15:
+            s += 4
+        elif rev > 0.05:
+            s += 2
 
-    # MOMENTUM
-    price = d.get("price", 0)
-    if price > 50:
+    # MOMENTUM proxy
+    if price > 20:
         s += 2
-    elif price > 20:
-        s += 1
 
     # SECTOR
     if d.get("sector") in ["Technology", "Healthcare", "Communication Services"]:
-        s += 1
+        s += 2
 
     return s
 
@@ -124,27 +126,27 @@ def score(d):
 # =========================
 # DISCORD
 # =========================
-def notify(df, total, processed, valid):
+def notify(df, stats):
     if not WEBHOOK_URL:
         print(df)
         return
 
     if df.empty:
-        msg = "⚠️ GrowthRadar v3: No candidates\n\n"
+        msg = "⚠️ GrowthRadar v5: No candidates"
     else:
-        msg = "🚀 GrowthRadar v3 (Tenbagger Mode)\n\n"
+        msg = "🚀 GrowthRadar v5 (Rate-Limit Safe)\n\n"
+
         for _, r in df.iterrows():
             msg += (
-                f"{r['ticker']} | Score:{r['score']}\n"
-                f"MCap:{r['mcap_b']}B | Sector:{r['sector']}\n"
-                f"RevGrowth:{r.get('revenue_growth', None)}\n\n"
+                f"{r['symbol']} | Score:{r['score']}\n"
+                f"MCap:{round(r['marketCap']/1e9,2)}B | Rev:{r.get('revenue_growth',0):.2f}\n\n"
             )
 
     msg += (
-        "--------------------\n"
-        f"Total: {total}\n"
-        f"Processed: {processed}\n"
-        f"Valid: {valid}\n"
+        "\n--- Stats ---\n"
+        f"Screener: {stats['screener']}\n"
+        f"Selected: {stats['selected']}\n"
+        f"Growth: {stats['growth']}\n"
     )
 
     requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
@@ -154,43 +156,34 @@ def notify(df, total, processed, valid):
 # MAIN
 # =========================
 def main():
-    tickers = get_tickers()
+    stats = {"screener": 0, "selected": 0, "growth": 0}
 
-    total = len(tickers)
-    processed = 0
-    valid = 0
+    # ① Screener
+    candidates = get_candidates()
+    stats["screener"] = len(candidates)
+
+    # ② Select
+    selected = select_top(candidates)
+    stats["selected"] = len(selected)
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = [ex.submit(fetch, t) for t in tickers]
+    # ③ Growth
+    for d in selected:
+        g = fetch_growth(d["symbol"])
+        if g is not None:
+            d["revenue_growth"] = g
+            stats["growth"] += 1
 
-        for f in as_completed(futures):
-            processed += 1
-
-            if processed % 500 == 0:
-                print(f"Processed: {processed}/{total}")
-
-            base = f.result()
-            if not base:
-                continue
-
-            growth = fetch_growth(base["ticker"])
-            base.update(growth)
-
-            valid += 1
-
-            base["score"] = score(base)
-            base["mcap_b"] = round(base.get("mcap", 0) / 1e9, 2)
-
-            results.append(base)
+        d["score"] = score(d)
+        results.append(d)
 
     df = pd.DataFrame(results)
 
     if not df.empty:
-        df = df.sort_values("score", ascending=False).head(20)
+        df = df[df["score"] >= 6].sort_values("score", ascending=False).head(15)
 
-    notify(df, total, processed, valid)
+    notify(df, stats)
 
 
 if __name__ == "__main__":
