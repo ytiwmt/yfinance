@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # =========================
-# CONFIG (v26.2)
+# CONFIG (v26.3)
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
@@ -24,17 +24,13 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-class GrowthRadarV26_2:
+class GrowthRadarV26_3:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
-    # =========================
-    # UNIVERSE
-    # =========================
     def load_universe(self):
         symbols = []
-
         sources = [
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
             "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv",
@@ -62,16 +58,13 @@ class GrowthRadarV26_2:
         random.shuffle(clean)
         return clean
 
-    # =========================
-    # TECHNICAL FILTER
-    # =========================
     def fetch_technical(self, ticker):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
             data = r["chart"]["result"][0]
 
-            # --- ゾンビ排除 ---
+            # ゾンビ排除
             last_trade_ts = data["meta"].get("regularMarketTime", 0)
             if (time.time() - last_trade_ts) > 86400 * 5:
                 return None
@@ -86,70 +79,57 @@ class GrowthRadarV26_2:
             if price < MIN_PRICE:
                 return None
 
-            # =========================
-            # RETURNS
-            # =========================
+            # ===== リターン =====
             m1 = price / close[-21] - 1
             m3 = price / close[-63] - 1
             m6 = price / close[-126] - 1
 
-            # =========================
-            # CORE FILTER
-            # =========================
+            # ===== コア =====
             if m6 < 0.3 or m1 > 1.5:
                 return None
 
             accel = m1 - m3
-            if accel < 0.15:
+            if accel < 0.2:   # ← 強化
                 return None
 
-            # =========================
-            # STABILITY
-            # =========================
+            # ===== 安定性 =====
             volat = np.std(close[-21:]) / np.mean(close[-21:])
-            if volat > 0.25:
+            if volat > 0.22:  # ← 少し厳格化
                 return None
 
-            # =========================
-            # VOLUME STRUCTURE（最重要）
-            # =========================
+            # ===== 出来高（厳格化） =====
             vol_short = np.mean(volume[-5:])
             vol_mid = np.mean(volume[-21:])
             vol_long = np.mean(volume[-63:])
 
-            if vol_mid < vol_long * 1.2:
+            # 明確な資金流入
+            if vol_mid < vol_long * 1.3:
                 return None
 
-            if vol_short < vol_mid * 0.8:
+            # 短期も維持
+            if vol_short < vol_mid * 0.9:
                 return None
 
             vol_ratio = vol_short / (vol_mid + 1e-9)
 
-            # =========================
-            # TREND QUALITY
-            # =========================
+            # ===== トレンド質（強化） =====
             trend_smooth = np.mean(close[-10:]) / np.mean(close[-30:-10]) - 1
 
-            if trend_smooth < 0.1:
+            if trend_smooth < 0.2:
                 return None
 
             return {
                 "ticker": ticker,
                 "price": price,
-                "m1": m1,
-                "m3": m3,
                 "m6": m6,
                 "accel": accel,
-                "vol": vol_ratio,
-                "trend": trend_smooth
+                "trend": trend_smooth,
+                "vol": vol_ratio
             }
 
         except:
             return None
 
-    # =========================
-    # META FETCH
-    # =========================
     def fetch_bulk_meta(self, tickers):
         meta = {}
         if not tickers:
@@ -171,9 +151,6 @@ class GrowthRadarV26_2:
 
         return meta
 
-    # =========================
-    # RUN
-    # =========================
     def run(self):
         universe = self.load_universe()
         batch = universe[:SCAN_SIZE]
@@ -184,7 +161,6 @@ class GrowthRadarV26_2:
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(self.fetch_technical, t): t for t in batch}
-
             for f in as_completed(futures):
                 r = f.result()
                 if r:
@@ -196,7 +172,6 @@ class GrowthRadarV26_2:
         meta_data = self.fetch_bulk_meta(valid_tickers)
 
         final_list = []
-
         for r in tech_results:
             m = meta_data.get(r["ticker"], {"name": r["ticker"], "mcap": 0})
 
@@ -212,36 +187,26 @@ class GrowthRadarV26_2:
 
         df = pd.DataFrame(final_list)
 
-        # =========================
-        # SCORE (rank-based)
-        # =========================
+        # ===== rankスコア =====
         for col in ["m6", "accel", "trend", "vol"]:
             df[col] = df[col].astype(float)
 
-        df["rank_m6"] = df["m6"].rank(pct=True)
-        df["rank_accel"] = df["accel"].rank(pct=True)
-        df["rank_trend"] = df["trend"].rank(pct=True)
-        df["rank_vol"] = df["vol"].rank(pct=True)
-
         df["score"] = (
-            df["rank_m6"] * 0.4 +
-            df["rank_accel"] * 0.2 +
-            df["rank_trend"] * 0.25 +
-            df["rank_vol"] * 0.15
+            df["m6"].rank(pct=True) * 0.4 +
+            df["accel"].rank(pct=True) * 0.2 +
+            df["trend"].rank(pct=True) * 0.25 +
+            df["vol"].rank(pct=True) * 0.15
         )
 
-        top = df.sort_values("score", ascending=False).head(15)
+        top = df.sort_values("score", ascending=False).head(10)
 
         self.report(top, len(batch), len(df))
 
-    # =========================
-    # REPORT
-    # =========================
     def report(self, df, scanned, valid):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v26.2 (Tenbagger Engine)",
+            f"🚀 GrowthRadar v26.3 (High Precision)",
             f"Scanned: {scanned} | Valid: {valid} | {now}\n"
         ]
 
@@ -264,4 +229,4 @@ class GrowthRadarV26_2:
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_2().run()
+    GrowthRadarV26_3().run()
