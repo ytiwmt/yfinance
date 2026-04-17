@@ -4,122 +4,95 @@ import pandas as pd
 import numpy as np
 import random
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # CONFIG
 # =========================
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-
 SCAN_SIZE = 2000
 MAX_WORKERS = 10
+STATE_FILE = "growthradar_v31_timeseries.json"
 MIN_PRICE = 2.0
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # =========================
-class UniverseProvider:
+# STATE (完全時系列)
+# =========================
+class TimeSeriesStore:
+    def __init__(self, path):
+        self.path = path
+        self.state = self.load()
 
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
 
-    # -------------------------
-    def github_universe(self):
-        try:
-            url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt"
-            r = self.session.get(url, timeout=10)
+    def update(self, df):
+        today = datetime.now().strftime("%Y-%m-%d")
 
-            if r.status_code != 200:
-                return []
+        for r in df.to_dict("records"):
+            t = r["ticker"]
 
-            lines = r.text.splitlines()
+            if t not in self.state:
+                self.state[t] = []
 
-            clean = []
-            for x in lines:
-                x = x.strip().upper()
+            self.state[t].append({
+                "date": today,
+                "price": float(r["price"]),
+                "score": float(r["score"]),
+                "m6": float(r["m6"]),
+                "trend": float(r["trend"])
+            })
 
-                # BRK.B / BF.B対応
-                if re.match(r"^[A-Z0-9\.\-]{1,6}$", x):
-                    clean.append(x)
+            # 過去データ保持制限（30〜90日想定）
+            self.state[t] = self.state[t][-60:]
 
-            return clean
+        with open(self.path, "w") as f:
+            json.dump(self.state, f)
 
-        except:
-            return []
+    def get_series(self, ticker):
+        return self.state.get(ticker, [])
 
-    # -------------------------
-    def nasdaq_universe(self):
-        try:
-            url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
-            df = pd.read_csv(url)
-            return df["Symbol"].dropna().astype(str).str.upper().tolist()
-        except:
-            return []
-
-    # -------------------------
-    def fallback_universe(self):
-        return [
-            "AAPL","MSFT","NVDA","AMZN","META",
-            "TSLA","GOOGL","AMD","PLTR","INTC",
-            "NFLX","AVGO","QCOM","ADBE","COST"
-        ]
-
-    # -------------------------
-    def get(self):
-        universe = []
-
-        # ① GitHub
-        u1 = self.github_universe()
-        print(f"[Universe] GitHub: {len(u1)}")
-        universe.extend(u1)
-
-        # ② NASDAQ
-        u2 = self.nasdaq_universe()
-        print(f"[Universe] NASDAQ: {len(u2)}")
-        universe.extend(u2)
-
-        # ③ fallback
-        if len(universe) < 500:
-            u3 = self.fallback_universe()
-            print(f"[Universe] Fallback used: {len(u3)}")
-            universe.extend(u3)
-
-        # 重複排除
-        universe = list(set(universe))
-
-        random.shuffle(universe)
-
-        return universe[:SCAN_SIZE]
 
 # =========================
-class GrowthRadarV29_1:
-
+class GrowthRadarV31:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self.uni = UniverseProvider()
+        self.state = TimeSeriesStore(STATE_FILE)
 
-    # -------------------------
-    def fetch(self, t):
+    # =========================
+    def load_universe(self):
+        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt"
+        r = self.session.get(url, timeout=10).text.split("\n")
+
+        symbols = [
+            s.strip().upper()
+            for s in r
+            if re.match(r"^[A-Z]{1,5}$", s)
+        ]
+
+        random.shuffle(symbols)
+        return symbols[:SCAN_SIZE]
+
+    # =========================
+    def fetch(self, ticker):
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1y&interval=1d"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
+            res = r["chart"]["result"][0]
 
-            res_list = r.get("chart", {}).get("result")
-            if not res_list:
-                return None
+            close = [c for c in res["indicators"]["quote"][0]["close"] if c]
 
-            res = res_list[0]
-
-            close = res["indicators"]["quote"][0].get("close", [])
-            volume = res["indicators"]["quote"][0].get("volume", [])
-
-            close = [c for c in close if c is not None]
-            volume = [v if v else 0 for v in volume]
-
-            if len(close) < 60:
+            if len(close) < 120:
                 return None
 
             price = close[-1]
@@ -127,82 +100,116 @@ class GrowthRadarV29_1:
                 return None
 
             m1 = price / close[-21] - 1
-            m3 = price / close[-63] - 1 if len(close) > 63 else m1
-            m6 = price / close[-120] - 1 if len(close) > 120 else m1
+            m3 = price / close[-63] - 1
+            m6 = price / close[-120] - 1
 
-            trend = np.mean(close[-10:]) / (np.mean(close[-30:-10]) + 1e-9) - 1
+            trend = np.mean(close[-10:]) / np.mean(close[-30:-10]) - 1
             accel = m1 - m3
 
+            # ===== raw score（絶対値禁止）=====
+            score = (
+                m6 * 0.4 +
+                accel * 0.3 +
+                trend * 0.3
+            )
+
             return {
-                "ticker": t,
+                "ticker": ticker,
                 "price": price,
-                "m1": m1,
-                "m3": m3,
                 "m6": m6,
                 "trend": trend,
-                "accel": accel
+                "accel": accel,
+                "score": score
             }
 
         except:
             return None
 
-    # -------------------------
-    def score(self, df):
-        df["momentum"] = (
-            df["m6"].rank(pct=True) * 0.4 +
-            df["accel"].rank(pct=True) * 0.3 +
-            df["trend"].rank(pct=True) * 0.3
-        )
-        return df.sort_values("momentum", ascending=False)
+    # =========================
+    def compute_trajectory(self, ticker):
+        series = self.state.get_series(ticker)
 
-    # -------------------------
+        if len(series) < 5:
+            return None
+
+        scores = [x["score"] for x in series]
+
+        # slope（一次トレンド）
+        x = np.arange(len(scores))
+        slope = np.polyfit(x, scores, 1)[0]
+
+        # acceleration（変化の変化）
+        if len(scores) >= 10:
+            mid = len(scores) // 2
+            slope1 = np.polyfit(x[:mid], scores[:mid], 1)[0]
+            slope2 = np.polyfit(x[mid:], scores[mid:], 1)[0]
+            accel = slope2 - slope1
+        else:
+            accel = 0
+
+        # persistence（上昇維持）
+        up_days = sum(1 for i in range(1, len(scores)) if scores[i] > scores[i-1])
+
+        return {
+            "ticker": ticker,
+            "slope": slope,
+            "accel": accel,
+            "persistence": up_days / len(scores)
+        }
+
+    # =========================
     def run(self):
-
-        universe = self.uni.get()
-
-        print(f"\n🚀 Universe size: {len(universe)}\n")
-
-        if len(universe) == 0:
-            print("CRITICAL: EMPTY UNIVERSE")
-            return
+        universe = self.load_universe()
 
         raw = []
-
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(self.fetch, t): t for t in universe}
-            for f in as_completed(futures):
-                r = f.result()
+            for r in ex.map(self.fetch, universe):
                 if r:
                     raw.append(r)
 
-        print(f"\nValid fetched: {len(raw)}")
-
-        if len(raw) == 0:
-            print("NO VALID DATA (fetch issue or API block)")
+        if not raw:
+            print("NO DATA")
             return
 
-        df = self.score(pd.DataFrame(raw))
+        df = pd.DataFrame(raw)
 
-        tier1 = df[df["momentum"] > 0.85]
-        tier2 = df[(df["momentum"] <= 0.85) & (df["momentum"] > 0.7)]
+        # ===== 保存（ここが本体）=====
+        self.state.update(df)
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # ===== trajectory評価 =====
+        traj = []
+        for t in df["ticker"]:
+            tr = self.compute_trajectory(t)
+            if tr:
+                traj.append(tr)
+
+        traj_df = pd.DataFrame(traj)
+
+        # ===== Tier設計（絶対値禁止）=====
+        tier1 = traj_df[(traj_df["slope"] > 0) & (traj_df["accel"] > 0.001)]
+        tier2 = traj_df[(traj_df["slope"] > 0)]
+
+        tier1 = tier1.sort_values("slope", ascending=False)
+        tier2 = tier2.sort_values("slope", ascending=False)
 
         print(f"""
-🚀 GrowthRadar v29.1
-Universe:{len(universe)} Valid:{len(df)}
-Tier1:{len(tier1)} Tier2:{len(tier2)} {now}
+🚀 GrowthRadar v31 (Trajectory Memory Engine)
 
-🔥 TOP Tier1
+Universe: {len(universe)}
+Tracked: {len(self.state.state)}
+Active: {len(traj_df)}
+
+🔥 Tier1 (Strong Uptrend)
 """)
 
         for r in tier1.head(10).to_dict("records"):
-            print(r["ticker"], r["momentum"])
+            print(f"{r['ticker']} slope:{r['slope']:.4f} accel:{r['accel']:.4f}")
 
-        print("\n👀 Tier2")
+        print("\n👀 Tier2 (Positive Drift)\n")
+
         for r in tier2.head(10).to_dict("records"):
-            print(r["ticker"], r["momentum"])
+            print(f"{r['ticker']} slope:{r['slope']:.4f} persistence:{r['persistence']:.2f}")
 
 
 if __name__ == "__main__":
-    GrowthRadarV29_1().run()
+    GrowthRadarV31().run()
