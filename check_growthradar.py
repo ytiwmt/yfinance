@@ -17,28 +17,16 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 MAX_WORKERS = 10
 SCAN_SIZE = 2000
 
+STATE_FILE = "state_v267.json"
+
 MIN_PRICE = 2.0
 MIN_MCAP = 5e7
 MIN_AVG_VOL_VAL = 5e5
 
-STATE_FILE = "state_v266.json"
-LOG_FILE = "trace_v266.log"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # =========================
-# LOGGING
-# =========================
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
+# STATE
 # =========================
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -51,7 +39,7 @@ def save_state(state):
         json.dump(state, f)
 
 # =========================
-class GrowthRadarV26_6_Debug:
+class GrowthRadarV26_7:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -85,8 +73,6 @@ class GrowthRadarV26_6_Debug:
     # =========================
     def fetch(self, ticker):
         try:
-            log(f"[FETCH START] {ticker}")
-
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
             res = r["chart"]["result"][0]
@@ -95,17 +81,14 @@ class GrowthRadarV26_6_Debug:
             volume = [v for v in res["indicators"]["quote"][0]["volume"] if v]
 
             if len(close) < 126:
-                log(f"[DROP LEN] {ticker}")
                 return None
 
             price = close[-1]
             if price < MIN_PRICE:
-                log(f"[DROP PRICE] {ticker} price={price}")
                 return None
 
             avg_vol_val = np.mean(close[-21:]) * np.mean(volume[-21:])
             if avg_vol_val < MIN_AVG_VOL_VAL:
-                log(f"[DROP LIQUIDITY] {ticker}")
                 return None
 
             m1 = price / close[-21] - 1
@@ -113,21 +96,9 @@ class GrowthRadarV26_6_Debug:
             m6 = price / close[-126] - 1
 
             if m6 < 0.3:
-                log(f"[DROP M6] {ticker} m6={m6:.2f}")
-                return None
-
-            if m1 > 1.5:
-                log(f"[DROP OVERHEAT] {ticker}")
                 return None
 
             trend = np.mean(close[-10:]) / np.mean(close[-30:-10]) - 1
-
-            volat = np.std(close[-21:]) / np.mean(close[-21:])
-            if volat > 0.25:
-                log(f"[DROP VOLAT] {ticker}")
-                return None
-
-            log(f"[PASS] {ticker} m6={m6:.2f} trend={trend:.2f}")
 
             return {
                 "ticker": ticker,
@@ -140,12 +111,11 @@ class GrowthRadarV26_6_Debug:
                 "vol_long": np.mean(volume[-63:])
             }
 
-        except Exception as e:
-            log(f"[ERROR] {ticker} {e}")
+        except:
             return None
 
     # =========================
-    def compute_score(self, df):
+    def score(self, df):
         df["vol_ratio"] = df["vol_short"] / (df["vol_mid"] + 1e-9)
 
         df["score"] = (
@@ -176,19 +146,32 @@ class GrowthRadarV26_6_Debug:
 
             state[t]["history"] = state[t]["history"][-10:]
 
-            log(f"[STATE UPDATE] {t} hist={len(state[t]['history'])}")
-
         return state
 
     # =========================
+    def build_state_view(self, state):
+        rows = []
+
+        for t, s in state.items():
+            hist = s["history"]
+            if len(hist) < 3:
+                continue
+
+            scores = [h["score"] for h in hist]
+
+            rows.append({
+                "ticker": t,
+                "state_score": np.mean(scores) * 0.7 + np.max(scores) * 0.3,
+                "momentum": scores[-1] - scores[0],
+                "stability": 1 - np.std(scores)
+            })
+
+        return pd.DataFrame(rows)
+
+    # =========================
     def run(self):
-        log("===== RUN START =====")
-
         universe = self.load_universe()
-        log(f"[UNIVERSE] {len(universe)}")
-
         batch = universe[:SCAN_SIZE]
-        log(f"[BATCH] {len(batch)}")
 
         raw = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -198,14 +181,10 @@ class GrowthRadarV26_6_Debug:
                 if r:
                     raw.append(r)
 
-        log(f"[RAW PASSED] {len(raw)}")
-
         if not raw:
-            log("NO DATA END")
             return
 
-        df = pd.DataFrame(raw)
-        df = self.compute_score(df)
+        df = self.score(pd.DataFrame(raw))
 
         # =========================
         # STATE
@@ -214,37 +193,55 @@ class GrowthRadarV26_6_Debug:
         state = self.update_state(df, state)
         save_state(state)
 
+        state_df = self.build_state_view(state)
+
+        # =========================
+        # LIVE (今日)
+        # =========================
+        live = df.sort_values("score", ascending=False)
+
+        live_tier1 = live[live["score"] > 0.80]
+        live_tier2 = live[(live["score"] <= 0.80) & (live["score"] > 0.60)]
+
+        # =========================
+        # STATE (持続力)
+        # =========================
+        state_top = state_df.sort_values("state_score", ascending=False)
+
+        # =========================
+        # MOMENTUM
+        # =========================
+        mom_top = state_df.sort_values("momentum", ascending=False)
+
         # =========================
         # REPORT
         # =========================
-        t1 = df[df["score"] > 0.75].sort_values("score", ascending=False)
-        t2 = df[(df["score"] <= 0.75) & (df["score"] > 0.55)].sort_values("score", ascending=False)
-
-        log(f"[TIER1] {len(t1)}")
-        log(f"[TIER2] {len(t2)}")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            "🚀 GrowthRadar v26.6 DEBUG",
-            f"Tier1:{len(t1)} Tier2:{len(t2)}\n",
-            "TOP TIER1"
+            f"🚀 GrowthRadar v26.7 (3-Layer Engine)",
+            f"Live:{len(live)} State:{len(state_df)} {now}\n"
         ]
 
-        for r in t1.head(10).to_dict("records"):
+        msg.append("🔥 LIVE Tier1")
+        for r in live_tier1.head(8).to_dict("records"):
             msg.append(f"{r['ticker']} S:{r['score']:.2f}")
 
-        msg.append("\nTOP TIER2")
+        msg.append("\n⚡ STATE (Persistent Strength)")
+        for r in state_top.head(8).to_dict("records"):
+            msg.append(f"{r['ticker']} S:{r['state_score']:.2f}")
 
-        for r in t2.head(10).to_dict("records"):
-            msg.append(f"{r['ticker']} S:{r['score']:.2f}")
+        msg.append("\n🚀 MOMENTUM (Change)")
+        for r in mom_top.head(8).to_dict("records"):
+            msg.append(f"{r['ticker']} Δ:{r['momentum']:.2f}")
 
         text = "\n".join(msg)
 
         if WEBHOOK_URL:
             requests.post(WEBHOOK_URL, json={"content": text})
 
-        log("===== RUN END =====")
         print(text)
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_6_Debug().run()
+    GrowthRadarV26_7().run()
