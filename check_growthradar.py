@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import random
 import re
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -20,50 +19,96 @@ MIN_PRICE = 2.0
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # =========================
-# DEBUG METRICS
-# =========================
-debug_log = {
-    "fetched": 0,
-    "failed_api": 0,
-    "failed_parse": 0,
-    "filtered_price": 0,
-    "filtered_data": 0,
-    "passed": 0
-}
-
-# =========================
-def log(reason, ticker):
-    print(f"[{reason}] {ticker}")
-
-# =========================
-class GrowthRadarV29Debug:
+class UniverseProvider:
 
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
-    # =========================
-    def load_universe(self):
-        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt"
-        r = self.session.get(url, timeout=10).text.split("\n")
-        clean = list(set([x.strip().upper() for x in r if re.match(r"^[A-Z]{1,5}$", x)]))
-        random.shuffle(clean)
-        return clean[:SCAN_SIZE]
+    # -------------------------
+    def github_universe(self):
+        try:
+            url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt"
+            r = self.session.get(url, timeout=10)
 
-    # =========================
+            if r.status_code != 200:
+                return []
+
+            lines = r.text.splitlines()
+
+            clean = []
+            for x in lines:
+                x = x.strip().upper()
+
+                # BRK.B / BF.B対応
+                if re.match(r"^[A-Z0-9\.\-]{1,6}$", x):
+                    clean.append(x)
+
+            return clean
+
+        except:
+            return []
+
+    # -------------------------
+    def nasdaq_universe(self):
+        try:
+            url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
+            df = pd.read_csv(url)
+            return df["Symbol"].dropna().astype(str).str.upper().tolist()
+        except:
+            return []
+
+    # -------------------------
+    def fallback_universe(self):
+        return [
+            "AAPL","MSFT","NVDA","AMZN","META",
+            "TSLA","GOOGL","AMD","PLTR","INTC",
+            "NFLX","AVGO","QCOM","ADBE","COST"
+        ]
+
+    # -------------------------
+    def get(self):
+        universe = []
+
+        # ① GitHub
+        u1 = self.github_universe()
+        print(f"[Universe] GitHub: {len(u1)}")
+        universe.extend(u1)
+
+        # ② NASDAQ
+        u2 = self.nasdaq_universe()
+        print(f"[Universe] NASDAQ: {len(u2)}")
+        universe.extend(u2)
+
+        # ③ fallback
+        if len(universe) < 500:
+            u3 = self.fallback_universe()
+            print(f"[Universe] Fallback used: {len(u3)}")
+            universe.extend(u3)
+
+        # 重複排除
+        universe = list(set(universe))
+
+        random.shuffle(universe)
+
+        return universe[:SCAN_SIZE]
+
+# =========================
+class GrowthRadarV29_1:
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.uni = UniverseProvider()
+
+    # -------------------------
     def fetch(self, t):
-
-        debug_log["fetched"] += 1
-
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
 
             res_list = r.get("chart", {}).get("result")
-
             if not res_list:
-                debug_log["failed_api"] += 1
-                log("API_EMPTY", t)
                 return None
 
             res = res_list[0]
@@ -71,30 +116,14 @@ class GrowthRadarV29Debug:
             close = res["indicators"]["quote"][0].get("close", [])
             volume = res["indicators"]["quote"][0].get("volume", [])
 
-            if not close or len(close) < 60:
-                debug_log["failed_parse"] += 1
-                log("TOO_SHORT", t)
+            close = [c for c in close if c is not None]
+            volume = [v if v else 0 for v in volume]
+
+            if len(close) < 60:
                 return None
 
             price = close[-1]
-
-            if price is None:
-                debug_log["failed_parse"] += 1
-                log("NO_PRICE", t)
-                return None
-
             if price < MIN_PRICE:
-                debug_log["filtered_price"] += 1
-                log("LOW_PRICE", t)
-                return None
-
-            # NaN除去
-            close = [c for c in close if c is not None]
-            volume = [v if v is not None else 0 for v in volume]
-
-            if len(close) < 60:
-                debug_log["failed_parse"] += 1
-                log("AFTER_CLEAN_TOO_SHORT", t)
                 return None
 
             m1 = price / close[-21] - 1
@@ -103,14 +132,6 @@ class GrowthRadarV29Debug:
 
             trend = np.mean(close[-10:]) / (np.mean(close[-30:-10]) + 1e-9) - 1
             accel = m1 - m3
-
-            # フィルタ
-            if abs(accel) < 0.02:
-                debug_log["filtered_data"] += 1
-                log("NO_ACCEL", t)
-                return None
-
-            debug_log["passed"] += 1
 
             return {
                 "ticker": t,
@@ -122,39 +143,28 @@ class GrowthRadarV29Debug:
                 "accel": accel
             }
 
-        except Exception as e:
-            debug_log["failed_api"] += 1
-            log(f"EXCEPTION {e}", t)
+        except:
             return None
 
-    # =========================
+    # -------------------------
     def score(self, df):
-
         df["momentum"] = (
             df["m6"].rank(pct=True) * 0.4 +
             df["accel"].rank(pct=True) * 0.3 +
             df["trend"].rank(pct=True) * 0.3
         )
-
         return df.sort_values("momentum", ascending=False)
 
-    # =========================
-    def report_debug(self):
-
-        print("\n📊 DEBUG SUMMARY")
-        for k, v in debug_log.items():
-            print(f"{k}: {v}")
-
-        total = debug_log["fetched"]
-        if total > 0:
-            print("\nSUCCESS RATE:", round(debug_log["passed"] / total * 100, 2), "%")
-
-    # =========================
+    # -------------------------
     def run(self):
 
-        universe = self.load_universe()
+        universe = self.uni.get()
 
-        print(f"\n🚀 v29-debug scanning {len(universe)} tickers...\n")
+        print(f"\n🚀 Universe size: {len(universe)}\n")
+
+        if len(universe) == 0:
+            print("CRITICAL: EMPTY UNIVERSE")
+            return
 
         raw = []
 
@@ -165,10 +175,10 @@ class GrowthRadarV29Debug:
                 if r:
                     raw.append(r)
 
-        self.report_debug()
+        print(f"\nValid fetched: {len(raw)}")
 
-        if not raw:
-            print("\n❌ NO VALID DATA (ALL FILTERED)")
+        if len(raw) == 0:
+            print("NO VALID DATA (fetch issue or API block)")
             return
 
         df = self.score(pd.DataFrame(raw))
@@ -178,26 +188,21 @@ class GrowthRadarV29Debug:
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        msg = [
-            "🚀 GrowthRadar v29-debug",
-            f"Scanned:{len(universe)} Valid:{len(df)} Tier1:{len(tier1)} Tier2:{len(tier2)} {now}",
-            "\n🔥 TOP Tier1"
-        ]
+        print(f"""
+🚀 GrowthRadar v29.1
+Universe:{len(universe)} Valid:{len(df)}
+Tier1:{len(tier1)} Tier2:{len(tier2)} {now}
+
+🔥 TOP Tier1
+""")
 
         for r in tier1.head(10).to_dict("records"):
-            msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
+            print(r["ticker"], r["momentum"])
 
-        msg.append("\n👀 Tier2")
+        print("\n👀 Tier2")
         for r in tier2.head(10).to_dict("records"):
-            msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
-
-        text = "\n".join(msg)
-
-        print("\n" + text)
-
-        if WEBHOOK_URL:
-            requests.post(WEBHOOK_URL, json={"content": text})
+            print(r["ticker"], r["momentum"])
 
 
 if __name__ == "__main__":
-    GrowthRadarV29Debug().run()
+    GrowthRadarV29_1().run()
