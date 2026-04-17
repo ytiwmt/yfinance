@@ -10,189 +10,237 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # =========================
-# CONFIG (v24.1 Ironclad Full)
+# CONFIG (v25 Tenbagger Core)
 # =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-UNIVERSE_FILE = "universe_v24.json"
-MAX_WORKERS = 12
+MAX_WORKERS = 10
+BATCH_SIZE = 1500  # 1回で広く拾う
 
-# フィルタ基準
-MIN_PRICE = 1.0
-MIN_MCAP = 5e7   # 50Mドル
-MAX_MCAP = 1.5e12 # 超巨大株も一応許容
+# テンバガー条件（厳格）
+MIN_PRICE = 2.0
+MIN_MCAP = 1e8       # 100M
+MAX_MCAP = 5e10      # 50B（ここ重要）
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0",
     "Accept": "application/json"
 }
 
-class GrowthRadarV24_1:
+# =========================
+# ENGINE
+# =========================
+class GrowthRadarV25:
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self.start_time = datetime.now()
 
+    # =========================
+    # UNIVERSE（広く＋現実株のみ）
+    # =========================
     def load_universe(self):
-        """銘柄リストを複数のソースから執拗に取得する"""
         symbols = []
-        
-        # 内蔵バックアップ（外部が全滅しても最低限これを回す）
-        hot_list = [
-            "IONQ","RKLB","ASTS","OKLO","LUNR","QUBT","RGTI","QBTS","EOSE","MAAS","BULL","UPST","TEM","MLYS","AUR","LUMN","HOOD","COIN","MARA","MSTR",
-            "PLTR","SOUN","BBAI","NNE","SMR","GGE","HITI","CGC","PLUG","RUN","ENPH","TSLA","RIVN","LCID","AFRM","SOFI","SQ","PYPL","SHOP","SE",
-            "NVDA","AMD","SMCI","ARM","SNOW","U","NET","CRWD","DDOG","ZS","OKTA","MDB","PATH","AHR","RDDT","ALAB","VRT","NXT","GCT","CELH"
-        ]
 
-        # 外部ソースの巡回
         sources = [
-            {"url": "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt", "type": "txt"},
-            {"url": "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv", "type": "csv"},
-            {"url": "https://raw.githubusercontent.com/yannick-cw/stock-tickers/master/data/tickers.json", "type": "json"}
+            "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
+            "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
         ]
 
-        print("Fetching universe from external sources...")
-        for src in sources:
+        for url in sources:
             try:
-                res = self.session.get(src["url"], timeout=10)
+                res = self.session.get(url, timeout=10)
                 if res.status_code == 200:
-                    if src["type"] == "txt":
-                        found = [s.strip().upper() for s in res.text.split('\n') if s.strip()]
-                    elif src["type"] == "csv":
-                        df = pd.read_csv(src["url"])
-                        found = df["Symbol"].dropna().astype(str).tolist()
-                    elif src["type"] == "json":
-                        data = res.json()
-                        found = [item["symbol"] if isinstance(item, dict) else item for item in data]
-                    
+                    if url.endswith(".txt"):
+                        found = res.text.split("\n")
+                    else:
+                        df = pd.read_csv(url)
+                        found = df["Symbol"].tolist()
+
                     symbols.extend(found)
-                    print(f"Loaded {len(found)} symbols from {src['url']}")
-                    if len(symbols) > 1000: break
-            except Exception as e:
-                print(f"Source failed ({src['url']}): {e}")
+            except:
+                pass
 
-        # クリーニング（1-5文字の英字のみ）
-        clean_symbols = list(set([str(s).upper().strip() for s in (symbols + hot_list) 
-                                 if re.match(r"^[A-Z]{1,5}$", str(s).upper().strip())]))
-        
-        random.shuffle(clean_symbols)
-        with open(UNIVERSE_FILE, "w") as f:
-            json.dump(clean_symbols, f)
-            
-        return clean_symbols
+        # clean
+        symbols = list(set([
+            s.strip().upper() for s in symbols
+            if re.match(r"^[A-Z]{1,5}$", str(s))
+        ]))
 
+        random.shuffle(symbols)
+        return symbols[:BATCH_SIZE]
+
+    # =========================
+    # BASIC INFO（ここが超重要）
+    # =========================
     def fetch_details(self, ticker):
-        """時価総額と正式名称を軽量APIで取得"""
         try:
             url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-            r = self.session.get(url, timeout=3).json()
+            r = self.session.get(url, timeout=5).json()
             data = r["quoteResponse"]["result"][0]
+
             return {
                 "mcap": data.get("marketCap", 0),
-                "name": data.get("longName", ticker),
-                "type": data.get("quoteType", "")
-            }
-        except:
-            return {"mcap": 0, "name": ticker, "type": ""}
-
-    def is_noise(self, name):
-        """SPACやワラントなどのノイズを検知"""
-        noise_keys = ["WARRANT", "UNIT", "ACQUISITION", "RIGHTS", "REDEMPTION"]
-        return any(k in name.upper() for k in noise_keys)
-
-    def fetch(self, ticker):
-        """テクニカルデータの取得と判定"""
-        try:
-            # チャートデータ取得
-            p_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
-            r = self.session.get(p_url, timeout=5)
-            j = r.json()["chart"]["result"][0]
-            
-            close = [c for c in j["indicators"]["quote"][0]["close"] if c is not None]
-            vol = [v for v in j["indicators"]["quote"][0]["volume"] if v is not None]
-
-            if len(close) < 60: return None
-            price = close[-1]
-            if price < MIN_PRICE: return None
-
-            # 指標計算
-            m1 = price / close[-21] - 1
-            m3 = price / close[-63] - 1 if len(close) > 63 else m1
-            accel = m1 - (price / close[-10] - 1) # 直近10日比の加速
-            vol_ratio = (sum(vol[-5:])/5) / (sum(vol[-21:])/21 + 1e-9)
-
-            # 詳細情報の取得
-            details = self.fetch_details(ticker)
-            
-            # ノイズフィルタ
-            if self.is_noise(details["name"]): return None
-            if details["mcap"] > 0 and (details["mcap"] < MIN_MCAP or details["mcap"] > MAX_MCAP): return None
-
-            return {
-                "ticker": ticker, 
-                "name": details["name"],
-                "price": price, 
-                "m1": m1, 
-                "accel": accel, 
-                "vol": vol_ratio, 
-                "mcap": details["mcap"]
+                "type": data.get("quoteType", ""),
+                "name": data.get("longName", "")
             }
         except:
             return None
 
-    def run(self):
+    def is_noise(self, name):
+        noise_keywords = ["WARRANT", "UNIT", "RIGHT", "ACQUISITION"]
+        return any(k in name.upper() for k in noise_keywords)
+
+    # =========================
+    # CORE ANALYSIS
+    # =========================
+    def analyze(self, ticker):
         try:
-            universe = self.load_universe()
-            # 1回のリミットを1200件に設定（API制限回避と網羅性のバランス）
-            batch = universe[:1200]
-            print(f"Scanning {len(batch)} symbols...")
+            # --- details first (重要：ここで9割カット) ---
+            d = self.fetch_details(ticker)
+            if not d:
+                return None
 
-            results = []
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                futures = {ex.submit(self.fetch, t): t for t in batch}
-                for f in as_completed(futures):
-                    r = f.result()
-                    if r: results.append(r)
+            # フィルタ①：実在株のみ
+            if d["type"] != "EQUITY":
+                return None
 
-            if not results:
-                self.send_webhook(f"⚠️ **GrowthRadar v24.1**\nスキャン対象 {len(batch)} 件中、有効な銘柄が見つかりませんでした。")
-                return
+            # フィルタ②：ノイズ除去
+            if self.is_noise(d["name"]):
+                return None
 
-            df = pd.DataFrame(results)
-            
-            # スコアリング（加速0.5、1ヶ月モメンタム0.3、出来高0.2）
-            for col in ["accel", "m1", "vol"]:
-                df[f"z_{col}"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-9)
+            mcap = d["mcap"]
+            if not mcap or not (MIN_MCAP <= mcap <= MAX_MCAP):
+                return None
 
-            df["score"] = (df["z_accel"] * 0.5 + df["z_m1"] * 0.3 + df["z_vol"] * 0.2)
-            
-            top_df = df.sort_values("score", ascending=False).head(15)
-            self.report(top_df, len(batch), len(df))
+            # --- price data ---
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
+            r = self.session.get(url, timeout=5)
+            j = r.json()["chart"]["result"][0]
 
-        except Exception as e:
-            self.send_webhook(f"🚨 **GrowthRadar Fatal Error**\n`{str(e)}`")
+            close = [c for c in j["indicators"]["quote"][0]["close"] if c is not None]
+            vol   = [v for v in j["indicators"]["quote"][0]["volume"] if v is not None]
 
-    def report(self, df, scanned, valid):
-        now = datetime.now().strftime("%Y/%m/%d %H:%M")
+            if len(close) < 120:
+                return None
+
+            price = close[-1]
+            if price < MIN_PRICE:
+                return None
+
+            # --- metrics ---
+            m1  = price / close[-21] - 1
+            m3  = price / close[-63] - 1
+            m6  = price / close[-120] - 1
+            m12 = price / close[0] - 1
+
+            accel = m1 - m3
+            vol_ratio = (sum(vol[-5:]) / 5) / (sum(vol[-30:]) / 30 + 1e-9)
+
+            # =========================
+            # TENBAGGER FILTER CORE
+            # =========================
+
+            # ① すでに終わった銘柄除外
+            if m12 > 3.0:
+                return None
+
+            # ② 中期トレンド必須
+            if not (0.2 < m3 < 1.5):
+                return None
+
+            # ③ 初動条件（過熱排除）
+            if m1 > 0.5:
+                return None
+
+            # ④ 加速
+            if accel < 0.1:
+                return None
+
+            # ⑤ 出来高確認
+            if vol_ratio < 1.2:
+                return None
+
+            # =========================
+            # SCORE
+            # =========================
+            score = (
+                (m3 * 10) +
+                (accel * 20) +
+                (vol_ratio * 5)
+            )
+
+            return {
+                "ticker": ticker,
+                "price": price,
+                "mcap": mcap,
+                "m1": m1,
+                "m3": m3,
+                "accel": accel,
+                "vol": vol_ratio,
+                "score": score
+            }
+
+        except:
+            return None
+
+    # =========================
+    # RUN
+    # =========================
+    def run(self):
+        universe = self.load_universe()
+        print(f"Scanning {len(universe)} symbols...")
+
+        results = []
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(self.analyze, t): t for t in universe}
+
+            for f in as_completed(futures):
+                r = f.result()
+                if r:
+                    results.append(r)
+
+        if not results:
+            self.output("No real tenbagger candidates today.")
+            return
+
+        df = pd.DataFrame(results)
+        df = df.sort_values("score", ascending=False).head(15)
+
+        self.report(df, len(universe), len(results))
+
+    # =========================
+    # OUTPUT
+    # =========================
+    def report(self, df, total, hits):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
         msg = [
-            f"🚀 **GrowthRadar v24.1 (Ironclad)**",
-            f"Universe: {scanned} | Valid: {valid} | {now}\n"
+            f"🚀 **GrowthRadar v25 (True Tenbagger Core)**",
+            f"Universe: {total} | Candidates: {hits} | {now}\n"
         ]
 
         for r in df.to_dict("records"):
-            mcap_str = f"${r['mcap']/1e9:.2f}B" if r['mcap'] > 0 else "N/A"
             msg.append(
-                f"**{r['ticker']}** ({r['name'][:15]}) | **Score: {r['score']:.2f}**\n"
-                f"└ Price: ${r['price']:.2f} | MC: {mcap_str}\n"
-                f"└ M1: {r['m1']:+.1%} | Accel: {r['accel']:+.2f} | Vol: {r['vol']:.1f}x"
+                f"**{r['ticker']}** | Score:{r['score']:.2f}\n"
+                f"Price:${r['price']:.2f} | MC:{r['mcap']/1e9:.2f}B\n"
+                f"M3:{r['m3']:+.1%} | M1:{r['m1']:+.1%}\n"
+                f"Accel:{r['accel']:.2f} | Vol:{r['vol']:.2f}x\n"
             )
 
-        self.send_webhook("\n".join(msg))
+        self.output("\n".join(msg))
 
-    def send_webhook(self, text):
+    def output(self, text):
         if WEBHOOK_URL:
-            try: requests.post(WEBHOOK_URL, json={"content": text}, timeout=10)
-            except: pass
+            try:
+                requests.post(WEBHOOK_URL, json={"content": text}, timeout=10)
+            except:
+                pass
         print(text)
 
+
+# =========================
+# ENTRY
+# =========================
 if __name__ == "__main__":
-    GrowthRadarV24_1().run()
+    GrowthRadarV25().run()
