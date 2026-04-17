@@ -15,8 +15,7 @@ from datetime import datetime
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 MAX_WORKERS = 10
-SCAN_SIZE = 1500
-
+SCAN_SIZE = 2000   # ← 少し拡張
 MIN_PRICE = 2.0
 MIN_MCAP = 5e7
 MIN_AVG_VOL_VAL = 5e5
@@ -29,13 +28,13 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-class GrowthRadarV26_5:
+class GrowthRadarV26_5_1:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
     # =========================
-    # UNIVERSE (fixed)
+    # UNIVERSE
     # =========================
     def load_universe(self):
         if os.path.exists(UNIVERSE_FILE):
@@ -70,8 +69,6 @@ class GrowthRadarV26_5:
         ]))
 
         random.shuffle(clean)
-
-        # 固定コアユニバース
         core = clean[:3000]
 
         with open(UNIVERSE_FILE, "w") as f:
@@ -80,7 +77,7 @@ class GrowthRadarV26_5:
         return core
 
     # =========================
-    # FETCH TECHNICAL
+    # FETCH
     # =========================
     def fetch(self, ticker):
         try:
@@ -192,7 +189,9 @@ class GrowthRadarV26_5:
         if df.empty:
             return
 
-        # Tier1
+        # =========================
+        # Tier1（不変）
+        # =========================
         df_t1 = df[
             (df["accel"] >= 0.20) &
             (df["trend"] >= 0.20) &
@@ -200,11 +199,13 @@ class GrowthRadarV26_5:
             (df["vol_short"] >= df["vol_mid"] * 0.9)
         ].copy()
 
-        # Tier2
+        # =========================
+        # Tier2（軽微緩和）
+        # =========================
         df_t2 = df[
-            (df["accel"] >= 0.18) &
-            (df["trend"] >= 0.15) &
-            (df["vol_mid"] >= df["vol_long"] * 1.1)
+            (df["accel"] >= 0.16) &          # ← 0.18 → 0.16
+            (df["trend"] >= 0.12) &          # ← 0.15 → 0.12
+            (df["vol_mid"] >= df["vol_long"] * 1.05)  # ← 緩和
         ].copy()
 
         def score(d):
@@ -223,7 +224,6 @@ class GrowthRadarV26_5:
         t2 = score(df_t2)
 
         output = self.report(t1, t2, len(batch), len(df))
-
         self.log(output)
 
     # =========================
@@ -233,7 +233,7 @@ class GrowthRadarV26_5:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v26.5 (Tracking Engine)",
+            f"🚀 GrowthRadar v26.5.1 (Balanced)",
             f"Scanned:{scanned} | Base:{base} | Tier1:{len(t1)} | Tier2:{len(t2)} | {now}\n"
         ]
 
@@ -255,4 +255,4 @@ class GrowthRadarV26_5:
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_5().run()
+    GrowthRadarV26_5_1().run()
