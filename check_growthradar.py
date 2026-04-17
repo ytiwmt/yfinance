@@ -2,11 +2,8 @@ import os, requests, pandas as pd, numpy as np, random, re, json, time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================
-# CONFIG
-# =========================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
-STATE_FILE = "growth_state_v32_1.json"
+STATE_FILE = "growth_state_v32_2.json"
 SCAN_SIZE = 1500
 MAX_WORKERS = 10
 MIN_PRICE = 2.0
@@ -22,16 +19,14 @@ class State:
     def load(self):
         if os.path.exists(STATE_FILE):
             try:
-                with open(STATE_FILE, "r") as f:
-                    return json.load(f)
+                return json.load(open(STATE_FILE))
             except:
                 return {}
         return {}
 
     def save(self):
         try:
-            with open(STATE_FILE, "w") as f:
-                json.dump(self.data, f)
+            json.dump(self.data, open(STATE_FILE, "w"))
         except Exception as e:
             print(f"[STATE SAVE ERROR] {e}")
 
@@ -43,12 +38,11 @@ class State:
         self.data[ticker] = hist[-30:]
 
 # =========================
-# UNIVERSE（冗長化）
+# UNIVERSE（安定）
 # =========================
 def load_universe():
     symbols = []
 
-    # NASDAQ (安定)
     try:
         df = pd.read_csv("https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv")
         symbols += df["Symbol"].tolist()
@@ -56,7 +50,6 @@ def load_universe():
     except:
         print("[NASDAQ FAIL]")
 
-    # GitHub backup
     try:
         txt = requests.get(
             "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all_tickers.txt",
@@ -106,7 +99,7 @@ def fetch(session, ticker):
 
         accel = m1 - (m3 / 3)
 
-        # ★ 修正スコア（加速重視）
+        # 加速重視
         score = (0.3 * m6) + (0.3 * trend) + (0.4 * accel)
 
         return {"ticker": ticker, "score": score, "price": price}
@@ -115,62 +108,57 @@ def fetch(session, ticker):
         return None
 
 # =========================
-# DETECTOR（簡素化＆安定）
+# DETECTOR（初期対応）
 # =========================
 def detect(state):
     results = []
 
     for t, hist in state.data.items():
-        if len(hist) < 7:
+        if len(hist) < 5:   # ← 初期対応で緩和
             continue
 
         scores = [h["s"] for h in hist]
-        x = np.arange(len(scores))
+        latest = scores[-1]
+        avg = np.mean(scores)
 
-        try:
-            slope = np.polyfit(x, scores, 1)[0]
-            latest = scores[-1]
-            avg = np.mean(scores)
+        # ★ コア条件（超重要）
+        if latest > avg:
 
-            boost = latest - avg
+            # ノイズ排除（微上昇は除く）
+            growth = (latest - scores[0]) if len(scores) > 1 else 0
 
-            # ★ シンプル条件
-            if slope > 0 and boost > 0:
+            if growth > 0.02:  # ← 調整可能（0.01〜0.05）
                 results.append({
                     "ticker": t,
                     "score": latest,
-                    "slope": slope,
-                    "boost": boost
+                    "growth": growth
                 })
-        except:
-            continue
 
-    return sorted(results, key=lambda x: (x["score"], x["slope"]), reverse=True)
+    return sorted(results, key=lambda x: x["score"], reverse=True)
 
 # =========================
-# REPORT（必ず送る）
+# REPORT
 # =========================
 def report(candidates, scanned, valid):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = [
-        f"🚀 GrowthRadar v32.1",
+        f"🚀 GrowthRadar v32.2",
         f"Scanned:{scanned} Valid:{valid} Candidates:{len(candidates)}",
         f"Time:{now}",
         ""
     ]
 
     if candidates:
-        msg.append("🔥 TOP CANDIDATES")
+        msg.append("🔥 EARLY MOMENTUM")
         for c in candidates[:10]:
             msg.append(
                 f"{c['ticker']} "
                 f"S:{c['score']:.2f} "
-                f"Slope:{c['slope']:.4f} "
-                f"Boost:{c['boost']:.3f}"
+                f"Growth:{c['growth']:.3f}"
             )
     else:
-        msg.append("⚠️ NO CANDIDATES (market contraction or early phase)")
+        msg.append("⚠️ NO CANDIDATES (very early or flat market)")
 
     text = "\n".join(msg)
     print(text)
@@ -178,7 +166,7 @@ def report(candidates, scanned, valid):
     if WEBHOOK_URL:
         try:
             res = requests.post(WEBHOOK_URL, json={"content": text[:1900]})
-            print(f"[WEBHOOK] status={res.status_code}")
+            print(f"[WEBHOOK] {res.status_code}")
         except Exception as e:
             print(f"[WEBHOOK ERROR] {e}")
 
