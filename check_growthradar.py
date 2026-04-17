@@ -17,7 +17,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 MAX_WORKERS = 10
 SCAN_SIZE = 2000
 
-STATE_FILE = "state_v267.json"
+STATE_FILE = "state_v2671.json"
 
 MIN_PRICE = 2.0
 MIN_MCAP = 5e7
@@ -39,7 +39,8 @@ def save_state(state):
         json.dump(state, f)
 
 # =========================
-class GrowthRadarV26_7:
+class GrowthRadarV26_7_1:
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -88,17 +89,20 @@ class GrowthRadarV26_7:
                 return None
 
             avg_vol_val = np.mean(close[-21:]) * np.mean(volume[-21:])
-            if avg_vol_val < MIN_AVG_VOL_VAL:
+            if np.isnan(avg_vol_val) or avg_vol_val < MIN_AVG_VOL_VAL:
                 return None
 
             m1 = price / close[-21] - 1
             m3 = price / close[-63] - 1
             m6 = price / close[-126] - 1
 
+            if np.isnan(m6):
+                return None
+
             if m6 < 0.3:
                 return None
 
-            trend = np.mean(close[-10:]) / np.mean(close[-30:-10]) - 1
+            trend = np.mean(close[-10:]) / (np.mean(close[-30:-10]) + 1e-9) - 1
 
             return {
                 "ticker": ticker,
@@ -153,18 +157,30 @@ class GrowthRadarV26_7:
         rows = []
 
         for t, s in state.items():
-            hist = s["history"]
-            if len(hist) < 3:
+            hist = s.get("history", [])
+
+            if len(hist) == 0:
                 continue
 
-            scores = [h["score"] for h in hist]
+            scores = [h.get("score", 0) for h in hist]
+
+            if len(scores) == 0:
+                continue
+
+            state_score = np.mean(scores) * 0.7 + np.max(scores) * 0.3
+
+            momentum = scores[-1] - scores[0] if len(scores) > 1 else 0
+            stability = 1 - (np.std(scores) if len(scores) > 1 else 0)
 
             rows.append({
                 "ticker": t,
-                "state_score": np.mean(scores) * 0.7 + np.max(scores) * 0.3,
-                "momentum": scores[-1] - scores[0],
-                "stability": 1 - np.std(scores)
+                "state_score": state_score,
+                "momentum": momentum,
+                "stability": stability
             })
+
+        if len(rows) == 0:
+            return pd.DataFrame(columns=["ticker", "state_score", "momentum", "stability"])
 
         return pd.DataFrame(rows)
 
@@ -181,7 +197,8 @@ class GrowthRadarV26_7:
                 if r:
                     raw.append(r)
 
-        if not raw:
+        if len(raw) == 0:
+            print("NO DATA")
             return
 
         df = self.score(pd.DataFrame(raw))
@@ -196,15 +213,15 @@ class GrowthRadarV26_7:
         state_df = self.build_state_view(state)
 
         # =========================
-        # LIVE (今日)
+        # LIVE
         # =========================
         live = df.sort_values("score", ascending=False)
 
-        live_tier1 = live[live["score"] > 0.80]
-        live_tier2 = live[(live["score"] <= 0.80) & (live["score"] > 0.60)]
+        live_t1 = live[live["score"] > 0.80]
+        live_t2 = live[(live["score"] <= 0.80) & (live["score"] > 0.60)]
 
         # =========================
-        # STATE (持続力)
+        # STATE
         # =========================
         state_top = state_df.sort_values("state_score", ascending=False)
 
@@ -219,29 +236,24 @@ class GrowthRadarV26_7:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            f"🚀 GrowthRadar v26.7 (3-Layer Engine)",
+            "🚀 GrowthRadar v26.7.1 (Stable)",
             f"Live:{len(live)} State:{len(state_df)} {now}\n"
         ]
 
         msg.append("🔥 LIVE Tier1")
-        for r in live_tier1.head(8).to_dict("records"):
+        for r in live_t1.head(8).to_dict("records"):
             msg.append(f"{r['ticker']} S:{r['score']:.2f}")
 
-        msg.append("\n⚡ STATE (Persistent Strength)")
+        msg.append("\n⚡ STATE")
         for r in state_top.head(8).to_dict("records"):
             msg.append(f"{r['ticker']} S:{r['state_score']:.2f}")
 
-        msg.append("\n🚀 MOMENTUM (Change)")
+        msg.append("\n🚀 MOMENTUM")
         for r in mom_top.head(8).to_dict("records"):
             msg.append(f"{r['ticker']} Δ:{r['momentum']:.2f}")
 
-        text = "\n".join(msg)
-
-        if WEBHOOK_URL:
-            requests.post(WEBHOOK_URL, json={"content": text})
-
-        print(text)
+        print("\n".join(msg))
 
 
 if __name__ == "__main__":
-    GrowthRadarV26_7().run()
+    GrowthRadarV26_7_1().run()
