@@ -15,71 +15,32 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL_GROWTHRADAR")
 
 SCAN_SIZE = 2000
 MAX_WORKERS = 10
-STATE_FILE = "growth_radar_timeseries.json"
-
 MIN_PRICE = 2.0
+
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # =========================
-# TIME SERIES STATE
+# DEBUG METRICS
 # =========================
-class TimeSeriesState:
-
-    def __init__(self, path):
-        self.path = path
-        self.data = self._load()
-
-    def _load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r") as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-
-    def update(self, df):
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        for r in df.to_dict("records"):
-            t = r["ticker"]
-
-            if t not in self.data:
-                self.data[t] = []
-
-            self.data[t].append({
-                "date": today,
-                "momentum": float(r["momentum"]),
-                "price": float(r["price"])
-            })
-
-            # メモリ制限（直近90日）
-            self.data[t] = self.data[t][-90:]
-
-    def get_series(self, ticker):
-        return self.data.get(ticker, [])
-
-    def save(self):
-        with open(self.path, "w") as f:
-            json.dump(self.data, f)
+debug_log = {
+    "fetched": 0,
+    "failed_api": 0,
+    "failed_parse": 0,
+    "filtered_price": 0,
+    "filtered_data": 0,
+    "passed": 0
+}
 
 # =========================
-def send(webhook, text):
-    if not webhook:
-        print(text)
-        return
-    try:
-        requests.post(webhook, json={"content": text}, timeout=10)
-    except:
-        pass
+def log(reason, ticker):
+    print(f"[{reason}] {ticker}")
 
 # =========================
-class GrowthRadarV29:
+class GrowthRadarV29Debug:
 
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self.state = TimeSeriesState(STATE_FILE)
 
     # =========================
     def load_universe(self):
@@ -91,28 +52,65 @@ class GrowthRadarV29:
 
     # =========================
     def fetch(self, t):
+
+        debug_log["fetched"] += 1
+
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1y&interval=1d"
             r = self.session.get(url, timeout=6).json()
-            res = r["chart"]["result"][0]
 
-            close = [c for c in res["indicators"]["quote"][0]["close"] if c]
-            volume = [v for v in res["indicators"]["quote"][0]["volume"] if v]
+            res_list = r.get("chart", {}).get("result")
 
-            if len(close) < 120:
+            if not res_list:
+                debug_log["failed_api"] += 1
+                log("API_EMPTY", t)
+                return None
+
+            res = res_list[0]
+
+            close = res["indicators"]["quote"][0].get("close", [])
+            volume = res["indicators"]["quote"][0].get("volume", [])
+
+            if not close or len(close) < 60:
+                debug_log["failed_parse"] += 1
+                log("TOO_SHORT", t)
                 return None
 
             price = close[-1]
+
+            if price is None:
+                debug_log["failed_parse"] += 1
+                log("NO_PRICE", t)
+                return None
+
             if price < MIN_PRICE:
+                debug_log["filtered_price"] += 1
+                log("LOW_PRICE", t)
+                return None
+
+            # NaN除去
+            close = [c for c in close if c is not None]
+            volume = [v if v is not None else 0 for v in volume]
+
+            if len(close) < 60:
+                debug_log["failed_parse"] += 1
+                log("AFTER_CLEAN_TOO_SHORT", t)
                 return None
 
             m1 = price / close[-21] - 1
-            m3 = price / close[-63] - 1
-            m6 = price / close[-120] - 1
+            m3 = price / close[-63] - 1 if len(close) > 63 else m1
+            m6 = price / close[-120] - 1 if len(close) > 120 else m1
 
             trend = np.mean(close[-10:]) / (np.mean(close[-30:-10]) + 1e-9) - 1
-
             accel = m1 - m3
+
+            # フィルタ
+            if abs(accel) < 0.02:
+                debug_log["filtered_data"] += 1
+                log("NO_ACCEL", t)
+                return None
+
+            debug_log["passed"] += 1
 
             return {
                 "ticker": t,
@@ -121,53 +119,45 @@ class GrowthRadarV29:
                 "m3": m3,
                 "m6": m6,
                 "trend": trend,
-                "accel": accel,
-                "vol": np.mean(volume[-21:])
+                "accel": accel
             }
 
-        except:
+        except Exception as e:
+            debug_log["failed_api"] += 1
+            log(f"EXCEPTION {e}", t)
             return None
 
     # =========================
     def score(self, df):
 
         df["momentum"] = (
-            df["m6"].rank(pct=True) * 0.35 +
-            df["accel"].rank(pct=True) * 0.35 +
-            df["trend"].rank(pct=True) * 0.30
+            df["m6"].rank(pct=True) * 0.4 +
+            df["accel"].rank(pct=True) * 0.3 +
+            df["trend"].rank(pct=True) * 0.3
         )
 
-        return df
+        return df.sort_values("momentum", ascending=False)
 
     # =========================
-    def detect_reentry(self, df):
+    def report_debug(self):
 
-        reentry = []
+        print("\n📊 DEBUG SUMMARY")
+        for k, v in debug_log.items():
+            print(f"{k}: {v}")
 
-        for r in df.to_dict("records"):
-            series = self.state.get_series(r["ticker"])
-
-            if len(series) < 5:
-                continue
-
-            # slope（直近5日トレンド）
-            recent = [x["momentum"] for x in series[-5:]]
-            slope = recent[-1] - recent[0]
-
-            prev_slope = series[-2]["momentum"] - series[-5]["momentum"]
-
-            # “沈んでから再上昇”
-            if prev_slope < 0 and slope > 0.15 and r["momentum"] > 0.75:
-                reentry.append(r)
-
-        return reentry
+        total = debug_log["fetched"]
+        if total > 0:
+            print("\nSUCCESS RATE:", round(debug_log["passed"] / total * 100, 2), "%")
 
     # =========================
     def run(self):
 
         universe = self.load_universe()
 
+        print(f"\n🚀 v29-debug scanning {len(universe)} tickers...\n")
+
         raw = []
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(self.fetch, t): t for t in universe}
             for f in as_completed(futures):
@@ -175,27 +165,23 @@ class GrowthRadarV29:
                 if r:
                     raw.append(r)
 
+        self.report_debug()
+
         if not raw:
-            print("NO DATA")
+            print("\n❌ NO VALID DATA (ALL FILTERED)")
             return
 
-        df = self.score(pd.DataFrame(raw)).sort_values("momentum", ascending=False)
+        df = self.score(pd.DataFrame(raw))
 
         tier1 = df[df["momentum"] > 0.85]
         tier2 = df[(df["momentum"] <= 0.85) & (df["momentum"] > 0.7)]
 
-        reentry = self.detect_reentry(df)
-
-        # STATE UPDATE（時系列）
-        self.state.update(df)
-        self.state.save()
-
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         msg = [
-            "📈 GrowthRadar v29 (Time-Series Engine)",
-            f"Live:{len(df)} Tier1:{len(tier1)} Tier2:{len(tier2)} ReEntry:{len(reentry)} {now}\n",
-            "🔥 Tier1"
+            "🚀 GrowthRadar v29-debug",
+            f"Scanned:{len(universe)} Valid:{len(df)} Tier1:{len(tier1)} Tier2:{len(tier2)} {now}",
+            "\n🔥 TOP Tier1"
         ]
 
         for r in tier1.head(10).to_dict("records"):
@@ -205,16 +191,13 @@ class GrowthRadarV29:
         for r in tier2.head(10).to_dict("records"):
             msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
 
-        if reentry:
-            msg.append("\n♻️ Re-Entry (Slope Break)")
-            for r in reentry[:8]:
-                msg.append(f"{r['ticker']} S:{r['momentum']:.2f}")
-
         text = "\n".join(msg)
 
-        print(text)
-        send(WEBHOOK_URL, text)
+        print("\n" + text)
+
+        if WEBHOOK_URL:
+            requests.post(WEBHOOK_URL, json={"content": text})
 
 
 if __name__ == "__main__":
-    GrowthRadarV29().run()
+    GrowthRadarV29Debug().run()
